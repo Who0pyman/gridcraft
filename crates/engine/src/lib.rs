@@ -94,6 +94,8 @@ pub struct DocState {
     pub revision: u64,
     pub uid: u64,
     pub title: String,
+    /// Original XLSX package bytes, preserved for lossless round-tripping.
+    pub original_xlsx: Option<Vec<u8>>,
     /// Per-sheet selection memory.
     pub sheet_selections: Vec<Selection>,
 }
@@ -118,6 +120,7 @@ impl DocState {
             revision: 1,
             uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             title,
+            original_xlsx: None,
             sheet_selections: vec![],
         }
     }

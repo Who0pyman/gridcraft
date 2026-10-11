@@ -62,7 +62,15 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
     {
         s.close_document(0);
     }
-    let i = s.add_document(DocState::new(wb, path, title));
+    let mut doc = DocState::new(wb, path, title);
+
+    // ORGrid: retain the original XLSX package so an untouched workbook
+    // can be saved without destroying unsupported Excel package parts.
+    if !imported && matches!(crate::io::FileKind::from_path(&name), Some(crate::io::FileKind::Xlsx)) {
+        doc.original_xlsx = Some(bytes.clone());
+    }
+
+    let i = s.add_document(doc);
     if !warnings.is_empty() {
         let mut message = warnings.iter().take(5).cloned().collect::<Vec<_>>().join("\n\n");
         if warnings.len() > 5 {
@@ -85,7 +93,14 @@ fn save(s: &mut Session, p: &Json) -> Result<Json> {
         }
     };
     let d = s.doc_mut()?;
-    let bytes = crate::io::save_bytes(&d.wb, &path)?;
+    let bytes = if matches!(crate::io::FileKind::from_path(&path), Some(crate::io::FileKind::Xlsx)) && !d.is_dirty() {
+        match &d.original_xlsx {
+            Some(original) => original.clone(),
+            None => crate::io::save_bytes(&d.wb, &path)?,
+        }
+    } else {
+        crate::io::save_bytes(&d.wb, &path)?
+    };
     crate::io::write_file(&path, &bytes)?;
     let kind = crate::io::FileKind::from_path(&path).unwrap_or(crate::io::FileKind::Xlsx);
     // Only a full-fidelity format clears the dirty flag and becomes the document's file.
