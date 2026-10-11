@@ -93,20 +93,36 @@ fn save(s: &mut Session, p: &Json) -> Result<Json> {
         }
     };
     let d = s.doc_mut()?;
-    let bytes = if matches!(crate::io::FileKind::from_path(&path), Some(crate::io::FileKind::Xlsx)) && !d.is_dirty() {
+    let kind = crate::io::FileKind::from_path(&path).unwrap_or(crate::io::FileKind::Xlsx);
+
+    let bytes = if matches!(kind, crate::io::FileKind::Xlsx) {
         match &d.original_xlsx {
-            Some(original) => original.clone(),
-            None => crate::io::save_bytes(&d.wb, &path)?,
+            Some(original) if !d.is_dirty() => original.clone(),
+            Some(original) if !d.xlsx_structural_dirty => gridcraft_xlsx::patch_xlsx(original, &d.saved, &d.wb, &d.xlsx_dirty_cells)
+                .map_err(|e| EngineError::Other(format!("Safe XLSX patch save failed: {e}")))?,
+            _ => crate::io::save_bytes(&d.wb, &path)?,
         }
     } else {
         crate::io::save_bytes(&d.wb, &path)?
     };
+
     crate::io::write_file(&path, &bytes)?;
-    let kind = crate::io::FileKind::from_path(&path).unwrap_or(crate::io::FileKind::Xlsx);
+
     // Only a full-fidelity format clears the dirty flag and becomes the document's file.
     if matches!(kind, crate::io::FileKind::Xlsx | crate::io::FileKind::Json) {
         d.saved = d.wb.clone();
         d.path = Some(path.clone());
+
+        if matches!(kind, crate::io::FileKind::Xlsx) {
+            d.original_xlsx = Some(bytes.clone());
+            d.xlsx_dirty_cells.clear();
+            d.xlsx_structural_dirty = false;
+        } else {
+            // A JSON save no longer has an XLSX package that corresponds to `saved`.
+            d.original_xlsx = None;
+            d.xlsx_dirty_cells.clear();
+            d.xlsx_structural_dirty = false;
+        }
     }
     Ok(json!({"path": path, "bytes": bytes.len()}))
 }

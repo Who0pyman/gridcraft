@@ -19,6 +19,7 @@ mod drawing;
 mod fmla;
 mod ods;
 mod package;
+mod patch;
 mod pivot;
 mod read;
 mod richdata;
@@ -77,6 +78,11 @@ pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
 /// Writes a workbook as an `.xlsx` package.
 pub fn write_xlsx(wb: &Workbook) -> Result<Vec<u8>, IoError> {
     write::write_xlsx(wb)
+}
+
+/// Patches non-structural cell edits into the original XLSX package.
+pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: &[(usize, gridcraft_core::CellRef)]) -> Result<Vec<u8>, IoError> {
+    patch::patch_xlsx(original, base, wb, dirty_cells)
 }
 
 /// CSV import options.
