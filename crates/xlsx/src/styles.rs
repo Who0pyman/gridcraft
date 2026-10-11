@@ -389,7 +389,7 @@ pub fn color_attrs(c: &Color) -> String {
     }
 }
 
-fn font_xml(f: &Font, dxf: bool) -> String {
+pub(crate) fn font_xml(f: &Font, dxf: bool) -> String {
     let mut s = String::from("<font>");
     if f.bold {
         s.push_str("<b/>");
@@ -427,7 +427,7 @@ fn font_xml(f: &Font, dxf: bool) -> String {
     s
 }
 
-fn fill_xml(f: &Fill, dxf: bool) -> String {
+pub(crate) fn fill_xml(f: &Fill, dxf: bool) -> String {
     if f.pattern == PatternType::None {
         return "<fill><patternFill patternType=\"none\"/></fill>".into();
     }
@@ -458,7 +458,7 @@ fn line_xml(tag: &str, l: &BorderLine) -> String {
     format!("<{tag} style=\"{}\">{color}</{tag}>", border_style_name(l.style))
 }
 
-fn border_xml(b: &Borders) -> String {
+pub(crate) fn border_xml(b: &Borders) -> String {
     let mut s = String::from("<border");
     if !b.diag_up.is_none() {
         s.push_str(" diagonalUp=\"1\"");
@@ -477,7 +477,7 @@ fn border_xml(b: &Borders) -> String {
     s
 }
 
-fn alignment_xml(a: &Alignment) -> Option<String> {
+pub(crate) fn alignment_xml(a: &Alignment) -> Option<String> {
     if *a == Alignment::default() {
         return None;
     }
@@ -527,7 +527,7 @@ fn alignment_xml(a: &Alignment) -> Option<String> {
     Some(s)
 }
 
-fn protection_xml(p: &Protection) -> Option<String> {
+pub(crate) fn protection_xml(p: &Protection) -> Option<String> {
     if *p == Protection::default() {
         return None;
     }

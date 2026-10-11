@@ -2,10 +2,248 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Cursor, Read};
 
 use gridcraft_core::{CellError, CellRef, Value};
-use gridcraft_model::Workbook;
+use gridcraft_model::{Style, Workbook};
 
 use crate::package::{Package, ZipOut, normalize};
 use crate::{IoError, xml};
+
+struct PatchStyles {
+    part: Option<String>,
+    text: Option<String>,
+    style_to_xf: HashMap<Style, u32>,
+    next_xf: u32,
+    next_font: u32,
+    next_fill: u32,
+    next_border: u32,
+    num_fmt_count: u32,
+    custom_num_fmts: HashMap<String, u32>,
+    used_num_fmt_ids: BTreeSet<u32>,
+    changed: bool,
+}
+
+impl PatchStyles {
+    fn load(pkg: &mut Package<'_>, part: Option<String>) -> Result<Self, IoError> {
+        let Some(name) = &part else {
+            return Ok(Self {
+                part,
+                text: None,
+                style_to_xf: HashMap::new(),
+                next_xf: 0,
+                next_font: 0,
+                next_fill: 0,
+                next_border: 0,
+                num_fmt_count: 0,
+                custom_num_fmts: HashMap::new(),
+                used_num_fmt_ids: BTreeSet::new(),
+                changed: false,
+            });
+        };
+
+        let bytes = pkg.read(name)?.ok_or_else(|| IoError::Format(format!("missing styles part {name}")))?;
+        let text = String::from_utf8(bytes.clone()).map_err(|_| IoError::Xml("styles.xml is not UTF-8".into()))?;
+        let root = xml::parse(&bytes)?;
+        let parsed = crate::styles::read_styles(&root);
+
+        let mut style_to_xf = HashMap::new();
+        for (index, style) in parsed.xfs.iter().cloned().enumerate() {
+            style_to_xf.entry(style).or_insert(index as u32);
+        }
+
+        let next_font = root.child("fonts").map(|e| e.kids("font").count() as u32).unwrap_or(0);
+        let next_fill = root.child("fills").map(|e| e.kids("fill").count() as u32).unwrap_or(0);
+        let next_border = root.child("borders").map(|e| e.kids("border").count() as u32).unwrap_or(0);
+        let next_xf = root.child("cellXfs").map(|e| e.kids("xf").count() as u32).unwrap_or(0);
+        let num_fmt_count = root.child("numFmts").map(|e| e.kids("numFmt").count() as u32).unwrap_or(0);
+
+        let mut custom_num_fmts = HashMap::new();
+        let mut used_num_fmt_ids = BTreeSet::new();
+
+        for (id, code) in parsed.num_fmts {
+            custom_num_fmts.entry(code).or_insert(id);
+            used_num_fmt_ids.insert(id);
+        }
+
+        for table in ["cellXfs", "cellStyleXfs"] {
+            if let Some(container) = root.child(table) {
+                for xf in container.kids("xf") {
+                    if let Some(id) = xf.attr_u32("numFmtId") {
+                        used_num_fmt_ids.insert(id);
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            part,
+            text: Some(text),
+            style_to_xf,
+            next_xf,
+            next_font,
+            next_fill,
+            next_border,
+            num_fmt_count,
+            custom_num_fmts,
+            used_num_fmt_ids,
+            changed: false,
+        })
+    }
+
+    fn style_index(&mut self, style: &Style) -> Result<u32, IoError> {
+        if let Some(&index) = self.style_to_xf.get(style) {
+            return Ok(index);
+        }
+
+        if self.text.is_none() {
+            return Err(IoError::Format("cannot create a non-default style because the original workbook has no styles part".into()));
+        }
+
+        let font_id = self.next_font;
+        self.next_font = self.next_font.saturating_add(1);
+        append_style_table_entry(
+            self.text.as_mut().ok_or_else(|| IoError::Format("styles.xml text unavailable during safe style patching".into()))?,
+            "fonts",
+            &crate::styles::font_xml(&style.font, false),
+            self.next_font,
+        )?;
+
+        let fill_id = self.next_fill;
+        self.next_fill = self.next_fill.saturating_add(1);
+        append_style_table_entry(
+            self.text.as_mut().ok_or_else(|| IoError::Format("styles.xml text unavailable during safe style patching".into()))?,
+            "fills",
+            &crate::styles::fill_xml(&style.fill, false),
+            self.next_fill,
+        )?;
+
+        let border_id = self.next_border;
+        self.next_border = self.next_border.saturating_add(1);
+        append_style_table_entry(
+            self.text.as_mut().ok_or_else(|| IoError::Format("styles.xml text unavailable during safe style patching".into()))?,
+            "borders",
+            &crate::styles::border_xml(&style.borders),
+            self.next_border,
+        )?;
+
+        let num_fmt_id = if let Some(id) = crate::tables::builtin_id(style.num_fmt.as_str()) {
+            id
+        } else if let Some(&id) = self.custom_num_fmts.get(style.num_fmt.as_str()) {
+            id
+        } else {
+            let mut id = 164u32;
+            while self.used_num_fmt_ids.contains(&id) {
+                id = id.saturating_add(1);
+            }
+
+            self.used_num_fmt_ids.insert(id);
+            self.custom_num_fmts.insert(style.num_fmt.as_str().to_string(), id);
+
+            let entry = format!(r#"<numFmt numFmtId="{id}" formatCode="{}"/>"#, xml::esc_attr(style.num_fmt.as_str()));
+
+            append_num_fmt_entry(
+                self.text.as_mut().ok_or_else(|| IoError::Format("styles.xml text unavailable during safe style patching".into()))?,
+                &entry,
+                self.num_fmt_count,
+            )?;
+            self.num_fmt_count = self.num_fmt_count.saturating_add(1);
+            id
+        };
+
+        let alignment = crate::styles::alignment_xml(&style.align);
+        let protection = crate::styles::protection_xml(&style.protection);
+
+        let mut xf = format!(r#"<xf numFmtId="{num_fmt_id}" fontId="{font_id}" fillId="{fill_id}" borderId="{border_id}" xfId="0""#);
+
+        if num_fmt_id != 0 {
+            xf.push_str(r#" applyNumberFormat="1""#);
+        }
+        if font_id != 0 {
+            xf.push_str(r#" applyFont="1""#);
+        }
+        if fill_id != 0 {
+            xf.push_str(r#" applyFill="1""#);
+        }
+        if border_id != 0 {
+            xf.push_str(r#" applyBorder="1""#);
+        }
+        if alignment.is_some() {
+            xf.push_str(r#" applyAlignment="1""#);
+        }
+        if protection.is_some() {
+            xf.push_str(r#" applyProtection="1""#);
+        }
+
+        if alignment.is_none() && protection.is_none() {
+            xf.push_str("/>");
+        } else {
+            xf.push('>');
+            xf.push_str(alignment.as_deref().unwrap_or(""));
+            xf.push_str(protection.as_deref().unwrap_or(""));
+            xf.push_str("</xf>");
+        }
+
+        let index = self.next_xf;
+        self.next_xf = self.next_xf.saturating_add(1);
+        append_style_table_entry(
+            self.text.as_mut().ok_or_else(|| IoError::Format("styles.xml text unavailable during safe style patching".into()))?,
+            "cellXfs",
+            &xf,
+            self.next_xf,
+        )?;
+
+        self.style_to_xf.insert(style.clone(), index);
+        self.changed = true;
+
+        Ok(index)
+    }
+
+    fn replacement(&self) -> Option<(&str, Vec<u8>)> {
+        if !self.changed {
+            return None;
+        }
+
+        Some((self.part.as_deref()?, self.text.as_ref()?.as_bytes().to_vec()))
+    }
+}
+
+fn append_style_table_entry(text: &mut String, tag: &str, entry: &str, new_count: u32) -> Result<(), IoError> {
+    let open_pat = format!("<{tag}");
+    let start = text.find(&open_pat).ok_or_else(|| IoError::Xml(format!("styles.xml has no <{tag}> element")))?;
+
+    let open_end_rel = text[start..].find('>').ok_or_else(|| IoError::Xml(format!("styles.xml has an unterminated <{tag}> element")))?;
+    let open_end = start + open_end_rel;
+
+    let original = text[start..=open_end].to_string();
+
+    if original.trim_end().ends_with("/>") {
+        return Err(IoError::Format(format!("safe XLSX patching does not yet support self-closing <{tag}/> style tables")));
+    }
+
+    let mut open = original[..original.len() - 1].trim_end().to_string();
+    open = remove_attr(&open, "count");
+    open.push_str(&format!(r#" count="{new_count}">"#));
+
+    text.replace_range(start..=open_end, &open);
+
+    let close_pat = format!("</{tag}>");
+    let close = text[start + open.len()..]
+        .find(&close_pat)
+        .map(|offset| start + open.len() + offset)
+        .ok_or_else(|| IoError::Xml(format!("styles.xml has no {close_pat}")))?;
+
+    text.insert_str(close, entry);
+    Ok(())
+}
+
+fn append_num_fmt_entry(text: &mut String, entry: &str, old_count: u32) -> Result<(), IoError> {
+    if text.contains("<numFmts") {
+        return append_style_table_entry(text, "numFmts", entry, old_count.saturating_add(1));
+    }
+
+    let fonts = text.find("<fonts").ok_or_else(|| IoError::Xml("styles.xml has no <fonts> element".into()))?;
+
+    text.insert_str(fonts, &format!(r#"<numFmts count="1">{entry}</numFmts>"#));
+    Ok(())
+}
 
 struct PatchSst {
     part: Option<String>,
@@ -88,11 +326,8 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
 
     let mut sst = PatchSst::load(&mut pkg, sst_part)?;
 
-    let original_xfs = if let Some(part) = wb_rels.iter().find(|r| r.kind == "styles").map(|r| r.target.clone()) {
-        pkg.read_xml(&part)?.map(|root| crate::styles::read_styles(&root).xfs)
-    } else {
-        None
-    };
+    let styles_part = wb_rels.iter().find(|r| r.kind == "styles").map(|r| r.target.clone());
+    let mut styles = PatchStyles::load(&mut pkg, styles_part)?;
 
     let mut dirty_by_sheet: BTreeMap<usize, BTreeSet<CellRef>> = BTreeMap::new();
     for &(sheet_index, cell_ref) in dirty_cells {
@@ -133,17 +368,9 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
                 if new_style.0 == 0 {
                     Some(0)
                 } else {
-                    let xfs = original_xfs.as_ref().ok_or_else(|| {
-                        IoError::Format(format!(
-                            "safe XLSX patching cannot apply a non-default style without an original styles part at {}!{}",
-                            sheet.name,
-                            cell_ref.a1()
-                        ))
-                    })?;
-                    let target = wb.styles.get(new_style);
-                    Some(xfs.iter().position(|style| style == target).ok_or_else(|| {
-                        IoError::Format(format!("safe XLSX patching does not yet support creating a new style at {}!{}", sheet.name, cell_ref.a1()))
-                    })? as u32)
+                    Some(styles.style_index(wb.styles.get(new_style)).map_err(|error| {
+                        IoError::Format(format!("safe XLSX patching could not apply style at {}!{}: {error}", sheet.name, cell_ref.a1()))
+                    })?)
                 }
             } else {
                 None
@@ -248,6 +475,10 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
         }
 
         replacements.insert(normalize(part), text.into_bytes());
+    }
+
+    if let Some((part, bytes)) = styles.replacement() {
+        replacements.insert(normalize(part), bytes);
     }
 
     if sst.changed() {
@@ -691,7 +922,7 @@ mod tests {
     use std::sync::Arc;
 
     use gridcraft_core::{CellRef, Value};
-    use gridcraft_model::{Cell, Formula};
+    use gridcraft_model::{Cell, Formula, NumFmt};
 
     use super::patch_xlsx;
     use crate::read_xlsx;
@@ -775,6 +1006,73 @@ mod tests {
 
         let (reopened, _) = read_xlsx(&patched).unwrap();
         assert_eq!(reopened.sheet(0).unwrap().style_id(at("B1")), reopened.sheet(0).unwrap().style_id(at("A1")));
+    }
+
+    #[test]
+    fn new_style_appends_to_styles_and_updates_cell() {
+        let original = styled_fixture();
+        let (base, _) = read_xlsx(&original).unwrap();
+        let mut wb = base.clone();
+
+        let current = wb.sheet(0).unwrap().style_id(at("B1"));
+        let italic = wb.styles.derive(current, |style| {
+            style.font.italic = true;
+        });
+
+        let formula = wb.sheet(0).unwrap().cell(at("B1")).unwrap().clone();
+        wb.sheet_mut(0).unwrap().set_cell(at("B1"), Cell { style: italic, ..formula });
+
+        let patched = patch_xlsx(&original, &base, &wb, &[(0, at("B1"))]).unwrap();
+
+        let before = parts(&original);
+        let after = parts(&patched);
+
+        assert_eq!(before.keys().collect::<Vec<_>>(), after.keys().collect::<Vec<_>>());
+
+        let changed: Vec<_> = before.iter().filter_map(|(name, data)| (after.get(name) != Some(data)).then_some(name.as_str())).collect();
+
+        assert_eq!(changed, vec!["xl/styles.xml", "xl/worksheets/sheet1.xml"]);
+        assert_eq!(before["xl/preserved.xml"], after["xl/preserved.xml"]);
+
+        let (reopened, _) = read_xlsx(&patched).unwrap();
+        let style_id = reopened.sheet(0).unwrap().style_id(at("B1"));
+        assert!(reopened.styles.get(style_id).font.italic);
+
+        let cell = reopened.sheet(0).unwrap().cell(at("B1")).unwrap();
+        assert_eq!(cell.formula.as_ref().unwrap().text, "A1+1");
+        assert_eq!(cell.value, Value::Number(2.0));
+    }
+
+    #[test]
+    fn new_custom_number_format_appends_to_styles() {
+        let original = styled_fixture();
+        let (base, _) = read_xlsx(&original).unwrap();
+        let mut wb = base.clone();
+
+        let current = wb.sheet(0).unwrap().style_id(at("A1"));
+        let custom = wb.styles.derive(current, |style| {
+            style.num_fmt = NumFmt::new(r#"0.0000 "nma""#);
+        });
+
+        let cell = wb.sheet(0).unwrap().cell(at("A1")).unwrap().clone();
+        wb.sheet_mut(0).unwrap().set_cell(at("A1"), Cell { style: custom, ..cell });
+
+        let patched = patch_xlsx(&original, &base, &wb, &[(0, at("A1"))]).unwrap();
+
+        let before = parts(&original);
+        let after = parts(&patched);
+
+        let changed: Vec<_> = before.iter().filter_map(|(name, data)| (after.get(name) != Some(data)).then_some(name.as_str())).collect();
+
+        assert_eq!(changed, vec!["xl/styles.xml", "xl/worksheets/sheet1.xml"]);
+        assert_eq!(before["xl/preserved.xml"], after["xl/preserved.xml"]);
+
+        let styles = String::from_utf8(after["xl/styles.xml"].clone()).unwrap();
+        assert!(styles.contains(r#"formatCode="0.0000 &quot;nma&quot;""#));
+
+        let (reopened, _) = read_xlsx(&patched).unwrap();
+        let style_id = reopened.sheet(0).unwrap().style_id(at("A1"));
+        assert_eq!(reopened.styles.get(style_id).num_fmt.as_str(), r#"0.0000 "nma""#);
     }
 
     #[test]
