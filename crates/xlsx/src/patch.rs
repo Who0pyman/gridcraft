@@ -117,6 +117,7 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
         }
 
         let mut edits = Vec::new();
+        let mut new_cells = Vec::new();
 
         for cell_ref in refs {
             let old_style = base_sheet.style_id(cell_ref);
@@ -142,8 +143,22 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
             }
 
             let a1 = cell_ref.a1();
+
             let Some((start, end, start_tag_end)) = find_cell_span(&text, &a1) else {
-                return Err(IoError::Format(format!("safe XLSX patching does not yet support creating a new cell at {}!{}", sheet.name, a1)));
+                if old_formula.is_some() || new_formula.is_some() {
+                    return Err(IoError::Format(format!("safe XLSX patching does not yet support creating a formula at {}!{}", sheet.name, a1)));
+                }
+
+                let value = new_cell.map(|cell| cell.value.scalar()).unwrap_or(Value::Empty);
+                let synthetic = format!(r#"<c r="{a1}"/>"#);
+                let (replacement, new_shared) = write_constant_cell(&synthetic, &value, &mut sst)?;
+
+                if new_shared {
+                    sst.count_changed = true;
+                }
+
+                new_cells.push((cell_ref, replacement));
+                continue;
             };
 
             let original_cell = &text[start..end];
@@ -177,6 +192,11 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
         edits.sort_by_key(|a| std::cmp::Reverse(a.start));
         for edit in edits {
             text.replace_range(edit.start..edit.end, &edit.replacement);
+        }
+
+        for (cell_ref, cell_xml) in new_cells {
+            let (start, end, replacement) = new_cell_edit(&text, cell_ref, &cell_xml)?;
+            text.replace_range(start..end, &replacement);
         }
 
         replacements.insert(normalize(part), text.into_bytes());
@@ -358,6 +378,114 @@ fn find_cell_span(xml: &str, wanted: &str) -> Option<(usize, usize, usize)> {
     }
 
     None
+}
+
+fn new_cell_edit(xml: &str, cell_ref: CellRef, cell_xml: &str) -> Result<(usize, usize, String), IoError> {
+    let target_row = cell_ref.row.saturating_add(1);
+
+    let sheet_data_start = xml.find("<sheetData").ok_or_else(|| IoError::Xml("worksheet has no <sheetData> element".into()))?;
+    let sheet_data_tag_end_rel =
+        xml[sheet_data_start..].find('>').ok_or_else(|| IoError::Xml("worksheet has an unterminated <sheetData> element".into()))?;
+    let sheet_data_tag_end = sheet_data_start + sheet_data_tag_end_rel + 1;
+    let sheet_data_start_tag = &xml[sheet_data_start..sheet_data_tag_end];
+
+    if sheet_data_start_tag.trim_end().ends_with("/>") {
+        let mut open = sheet_data_start_tag[..sheet_data_start_tag.len() - 1].trim_end().to_string();
+        if open.ends_with('/') {
+            open.pop();
+            open = open.trim_end().to_string();
+        }
+
+        return Ok((sheet_data_start, sheet_data_tag_end, format!("{open}><row r=\"{target_row}\">{cell_xml}</row></sheetData>")));
+    }
+
+    let sheet_data_close_rel =
+        xml[sheet_data_tag_end..].find("</sheetData>").ok_or_else(|| IoError::Xml("worksheet has no </sheetData> element".into()))?;
+    let sheet_data_close = sheet_data_tag_end + sheet_data_close_rel;
+
+    let bytes = xml.as_bytes();
+    let mut pos = sheet_data_tag_end;
+
+    while pos < sheet_data_close {
+        let Some(rel) = xml[pos..sheet_data_close].find("<row") else {
+            break;
+        };
+
+        let row_start = pos + rel;
+        let after_row = row_start + 4;
+        let next = bytes.get(after_row).copied();
+        if !matches!(next, Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') | Some(b'>') | Some(b'/')) {
+            pos = after_row;
+            continue;
+        }
+
+        let row_tag_end_rel =
+            xml[row_start..sheet_data_close].find('>').ok_or_else(|| IoError::Xml("worksheet has an unterminated <row> element".into()))?;
+        let row_tag_end = row_start + row_tag_end_rel + 1;
+        let row_start_tag = &xml[row_start..row_tag_end];
+
+        let row_number = attr_value(row_start_tag, "r").and_then(|value| value.parse::<u32>().ok());
+
+        if row_number == Some(target_row) {
+            if row_start_tag.trim_end().ends_with("/>") {
+                let mut open = row_start_tag[..row_start_tag.len() - 1].trim_end().to_string();
+                if open.ends_with('/') {
+                    open.pop();
+                    open = open.trim_end().to_string();
+                }
+
+                return Ok((row_start, row_tag_end, format!("{open}>{cell_xml}</row>")));
+            }
+
+            let row_close_rel =
+                xml[row_tag_end..sheet_data_close].find("</row>").ok_or_else(|| IoError::Xml("worksheet row has no </row> element".into()))?;
+            let row_close = row_tag_end + row_close_rel;
+
+            let mut cell_pos = row_tag_end;
+            while cell_pos < row_close {
+                let Some(cell_rel) = xml[cell_pos..row_close].find("<c") else {
+                    break;
+                };
+
+                let cell_start = cell_pos + cell_rel;
+                let after_c = cell_start + 2;
+                let next = bytes.get(after_c).copied();
+                if !matches!(next, Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') | Some(b'>') | Some(b'/')) {
+                    cell_pos = after_c;
+                    continue;
+                }
+
+                let cell_tag_end_rel =
+                    xml[cell_start..row_close].find('>').ok_or_else(|| IoError::Xml("worksheet has an unterminated <c> element".into()))?;
+                let cell_tag_end = cell_start + cell_tag_end_rel + 1;
+                let cell_start_tag = &xml[cell_start..cell_tag_end];
+
+                if let Some(existing) = attr_value(cell_start_tag, "r").and_then(|value| CellRef::parse(&value))
+                    && existing.col > cell_ref.col
+                {
+                    return Ok((cell_start, cell_start, cell_xml.to_string()));
+                }
+
+                cell_pos = cell_tag_end;
+            }
+
+            return Ok((row_close, row_close, cell_xml.to_string()));
+        }
+
+        if row_number.is_some_and(|row| row > target_row) {
+            return Ok((row_start, row_start, format!("<row r=\"{target_row}\">{cell_xml}</row>")));
+        }
+
+        if row_start_tag.trim_end().ends_with("/>") {
+            pos = row_tag_end;
+        } else {
+            let row_close_rel =
+                xml[row_tag_end..sheet_data_close].find("</row>").ok_or_else(|| IoError::Xml("worksheet row has no </row> element".into()))?;
+            pos = row_tag_end + row_close_rel + 6;
+        }
+    }
+
+    Ok((sheet_data_close, sheet_data_close, format!("<row r=\"{target_row}\">{cell_xml}</row>")))
 }
 
 fn attr_value(tag: &str, wanted: &str) -> Option<String> {
@@ -546,6 +674,38 @@ mod tests {
 
         let (reopened, _) = read_xlsx(&patched).unwrap();
         assert_eq!(reopened.sheet(0).unwrap().value(at("A1")), Value::Number(9.0));
+    }
+
+    #[test]
+    fn new_constant_cell_in_existing_row_changes_only_worksheet() {
+        let original = fixture();
+        let (base, _) = read_xlsx(&original).unwrap();
+        let mut wb = base.clone();
+
+        wb.sheet_mut(0).unwrap().set_value(at("C1"), Value::Number(42.0));
+
+        let patched = patch_xlsx(&original, &base, &wb, &[(0, at("C1"))]).unwrap();
+
+        assert_only_sheet_changed(&original, &patched);
+
+        let (reopened, _) = read_xlsx(&patched).unwrap();
+        assert_eq!(reopened.sheet(0).unwrap().value(at("C1")), Value::Number(42.0));
+    }
+
+    #[test]
+    fn new_constant_cell_can_create_new_row() {
+        let original = fixture();
+        let (base, _) = read_xlsx(&original).unwrap();
+        let mut wb = base.clone();
+
+        wb.sheet_mut(0).unwrap().set_value(at("A3"), Value::Text("new row".into()));
+
+        let patched = patch_xlsx(&original, &base, &wb, &[(0, at("A3"))]).unwrap();
+
+        assert_only_sheet_changed(&original, &patched);
+
+        let (reopened, _) = read_xlsx(&patched).unwrap();
+        assert_eq!(reopened.sheet(0).unwrap().value(at("A3")), Value::Text("new row".into()));
     }
 
     #[test]
