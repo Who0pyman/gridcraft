@@ -803,7 +803,17 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
                     write_constant_cell(&synthetic, &value, &mut sst)?
                 };
 
-                if let Some(style_index) = style_index {
+                let new_cell_style_index = if let Some(style_index) = style_index {
+                    Some(style_index)
+                } else if new_style.0 != 0 {
+                    Some(styles.style_index(wb.styles.get(new_style)).map_err(|error| {
+                        IoError::Format(format!("safe XLSX patching could not apply style at {}!{}: {error}", sheet.name, cell_ref.a1()))
+                    })?)
+                } else {
+                    None
+                };
+
+                if let Some(style_index) = new_cell_style_index {
                     replacement = set_cell_style(&replacement, style_index)?;
                 }
 
@@ -1720,6 +1730,39 @@ mod tests {
         assert_only_sheet_changed(&original, &patched);
 
         let (reopened, _) = read_xlsx(&patched).unwrap();
+        assert_eq!(reopened.sheet(0).unwrap().value(at("C1")), Value::Number(42.0));
+    }
+
+    #[test]
+    fn new_constant_cell_preserves_inherited_row_style() {
+        let styles = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font/><font><b/><name val="Arial"/><sz val="10"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border/></borders><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" applyFont="1"/></cellXfs></styleSheet>"#;
+        let rels =
+            r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>"#;
+
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1" s="1" customFormat="1"><c r="A1"><v>1</v></c></row></sheetData>"#,
+            &[("xl/styles.xml", styles), ("xl/preserved.xml", "<preserved>leave me alone</preserved>")],
+            rels,
+            "",
+        );
+
+        let (base, _) = read_xlsx(&original).unwrap();
+        let inherited = base.sheet(0).unwrap().style_id(at("C1"));
+        assert_ne!(inherited.0, 0);
+
+        let mut wb = base.clone();
+        wb.sheet_mut(0).unwrap().set_value(at("C1"), Value::Number(42.0));
+
+        let patched = patch_xlsx(&original, &base, &wb, &[(0, at("C1"))]).unwrap();
+
+        assert_only_sheet_changed(&original, &patched);
+
+        let after = parts(&patched);
+        let sheet = String::from_utf8(after["xl/worksheets/sheet1.xml"].clone()).unwrap();
+        assert!(sheet.contains(r#"<c r="C1" s="1"><v>42</v></c>"#));
+
+        let (reopened, _) = read_xlsx(&patched).unwrap();
+        assert_eq!(reopened.sheet(0).unwrap().style_id(at("C1")), inherited);
         assert_eq!(reopened.sheet(0).unwrap().value(at("C1")), Value::Number(42.0));
     }
 
