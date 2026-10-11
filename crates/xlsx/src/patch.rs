@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Cursor, Read};
 
-use gridcraft_core::{CellRef, Value};
+use gridcraft_core::{CellError, CellRef, Value};
 use gridcraft_model::Workbook;
 
 use crate::package::{Package, ZipOut, normalize};
@@ -135,13 +135,9 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
             let old_formula = old_cell.and_then(|c| c.formula.as_ref());
             let new_formula = new_cell.and_then(|c| c.formula.as_ref());
 
-            if old_formula != new_formula {
-                return Err(IoError::Format(format!("safe XLSX patching does not yet support formula edits at {}!{}", sheet.name, cell_ref.a1())));
-            }
-
             // A dependent formula may have received a new cached result after recalculation.
-            // Preserve the original formula cell exactly; Excel can recalculate it.
-            if old_formula.is_some() {
+            // Preserve an unchanged formula cell exactly; Excel can recalculate it.
+            if old_formula.is_some() && old_formula == new_formula {
                 continue;
             }
 
@@ -157,7 +153,19 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
 
             let value = new_cell.map(|cell| cell.value.scalar()).unwrap_or(Value::Empty);
 
-            let (replacement, new_shared) = write_constant_cell(original_cell, &value, &mut sst)?;
+            let (replacement, new_shared) = match (old_formula, new_formula) {
+                (Some(_), Some(formula)) => {
+                    let raw_value = new_cell.map(|cell| &cell.value).unwrap_or(&Value::Empty);
+                    (write_formula_cell(original_cell, formula, raw_value)?, false)
+                }
+                (Some(_), None) => {
+                    return Err(IoError::Format(format!("safe XLSX patching does not yet support removing a formula at {}!{}", sheet.name, a1)));
+                }
+                (None, Some(_)) => {
+                    return Err(IoError::Format(format!("safe XLSX patching does not yet support creating a formula at {}!{}", sheet.name, a1)));
+                }
+                (None, None) => write_constant_cell(original_cell, &value, &mut sst)?,
+            };
 
             if old_shared != new_shared {
                 sst.count_changed = true;
@@ -203,6 +211,60 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
     }
 
     out.finish()
+}
+
+fn write_formula_cell(original_cell: &str, formula: &gridcraft_model::Formula, value: &Value) -> Result<String, IoError> {
+    let tag_end = original_cell.find('>').ok_or_else(|| IoError::Xml("cell start tag is not closed".into()))?;
+    let original_start = &original_cell[..=tag_end];
+
+    if attr_value(original_start, "cm").is_some() || formula.array.is_some() || matches!(value, Value::Array(_)) {
+        return Err(IoError::Format("safe XLSX patching does not yet support array or dynamic formula edits".into()));
+    }
+
+    let formula_start = original_cell.find("<f").ok_or_else(|| IoError::Xml("formula cell has no <f> element".into()))?;
+    let formula_tag_end_rel =
+        original_cell[formula_start..].find('>').ok_or_else(|| IoError::Xml("formula element start tag is not closed".into()))?;
+    let formula_tag_end = formula_start + formula_tag_end_rel;
+    let formula_start_tag = &original_cell[formula_start..=formula_tag_end];
+
+    if formula_start_tag.trim() != "<f>" {
+        return Err(IoError::Format("safe XLSX patching does not yet support shared, array, or attributed formula elements".into()));
+    }
+
+    let mut open = original_start[..original_start.len() - 1].trim_end().to_string();
+    if open.ends_with('/') {
+        open.pop();
+        open = open.trim_end().to_string();
+    }
+    open = remove_attr(&open, "t");
+
+    let value = match value {
+        Value::Error(CellError::Circ) => Value::Number(0.0),
+        Value::Error(CellError::Spill | CellError::Calc) => Value::Error(CellError::Value),
+        value => value.clone(),
+    };
+
+    let cell_type = match &value {
+        Value::Text(_) => " t=\"str\"",
+        Value::Bool(_) => " t=\"b\"",
+        Value::Error(_) => " t=\"e\"",
+        _ => "",
+    };
+
+    let formula_text = xml::esc(&crate::fmla::to_file(formula));
+    let mut out = format!("{open}{cell_type}><f>{formula_text}</f>");
+
+    match &value {
+        Value::Number(number) => out.push_str(&format!("<v>{}</v>", xml::num(*number))),
+        Value::Text(text) => out.push_str(&format!("<v>{}</v>", xml::esc(&xml::encode_xstring(text)))),
+        Value::Bool(value) => out.push_str(&format!("<v>{}</v>", u8::from(*value))),
+        Value::Error(error) => out.push_str(&format!("<v>{}</v>", error.as_str())),
+        Value::Empty => {}
+        Value::Array(_) => return Err(IoError::Format("array formula cache is not supported by safe XLSX patching".into())),
+    }
+
+    out.push_str("</c>");
+    Ok(out)
 }
 
 fn write_constant_cell(original_cell: &str, value: &Value, sst: &mut PatchSst) -> Result<(String, bool), IoError> {
