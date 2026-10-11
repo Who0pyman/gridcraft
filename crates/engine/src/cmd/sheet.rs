@@ -286,6 +286,10 @@ fn insert_lines(s: &mut Session, p: &Json, axis: Axis) -> Result<Json> {
             }
         }
         rewrite(&mut cx.wb, &name, &Edit::Insert { axis, at, count });
+        cx.xlsx_structural_edits.push(match axis {
+            Axis::Rows => gridcraft_xlsx::StructuralEdit::InsertRows { sheet, at, count },
+            Axis::Cols => gridcraft_xlsx::StructuralEdit::InsertColumns { sheet, at, count },
+        });
         cx.structural = true;
         Ok(Json::Null)
     })?;
@@ -314,6 +318,10 @@ fn delete_lines(s: &mut Session, p: &Json, axis: Axis) -> Result<Json> {
             shift_sheet_features(sh, axis, at, count, false);
         }
         rewrite(&mut cx.wb, &name, &Edit::Delete { axis, at, count });
+        cx.xlsx_structural_edits.push(match axis {
+            Axis::Rows => gridcraft_xlsx::StructuralEdit::DeleteRows { sheet, at, count },
+            Axis::Cols => gridcraft_xlsx::StructuralEdit::DeleteColumns { sheet, at, count },
+        });
         cx.structural = true;
         Ok(Json::Null)
     })?;

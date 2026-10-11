@@ -80,9 +80,29 @@ pub fn write_xlsx(wb: &Workbook) -> Result<Vec<u8>, IoError> {
     write::write_xlsx(wb)
 }
 
+/// A worksheet structural edit that can be patched into an existing XLSX package.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StructuralEdit {
+    InsertRows { sheet: usize, at: u32, count: u32 },
+    DeleteRows { sheet: usize, at: u32, count: u32 },
+    InsertColumns { sheet: usize, at: u32, count: u32 },
+    DeleteColumns { sheet: usize, at: u32, count: u32 },
+}
+
 /// Patches non-structural cell edits into the original XLSX package.
 pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: &[(usize, gridcraft_core::CellRef)]) -> Result<Vec<u8>, IoError> {
     patch::patch_xlsx(original, base, wb, dirty_cells)
+}
+
+/// Patches supported row/column structural edits into the original XLSX package.
+pub fn patch_xlsx_structural(
+    original: &[u8],
+    base: &Workbook,
+    wb: &Workbook,
+    dirty_cells: &[(usize, gridcraft_core::CellRef)],
+    edits: &[StructuralEdit],
+) -> Result<Vec<u8>, IoError> {
+    patch::patch_xlsx_structural(original, base, wb, dirty_cells, edits)
 }
 
 /// CSV import options.

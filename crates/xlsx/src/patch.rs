@@ -293,6 +293,397 @@ impl PatchSst {
     }
 }
 
+fn shifted_cell_ref(cell: CellRef, edit: crate::StructuralEdit) -> Option<CellRef> {
+    match edit {
+        crate::StructuralEdit::InsertRows { at, count, .. } => {
+            if cell.row >= at {
+                Some(CellRef::new(cell.row.checked_add(count)?, cell.col))
+            } else {
+                Some(cell)
+            }
+        }
+        crate::StructuralEdit::DeleteRows { at, count, .. } => {
+            let end = at.saturating_add(count);
+            if cell.row >= at && cell.row < end {
+                None
+            } else if cell.row >= end {
+                Some(CellRef::new(cell.row - count, cell.col))
+            } else {
+                Some(cell)
+            }
+        }
+        crate::StructuralEdit::InsertColumns { at, count, .. } => {
+            if cell.col >= at {
+                Some(CellRef::new(cell.row, cell.col.checked_add(count)?))
+            } else {
+                Some(cell)
+            }
+        }
+        crate::StructuralEdit::DeleteColumns { at, count, .. } => {
+            let end = at.saturating_add(count);
+            if cell.col >= at && cell.col < end {
+                None
+            } else if cell.col >= end {
+                Some(CellRef::new(cell.row, cell.col - count))
+            } else {
+                Some(cell)
+            }
+        }
+    }
+}
+
+fn set_tag_attr(tag: &str, name: &str, value: &str) -> Result<String, IoError> {
+    if !tag.ends_with('>') {
+        return Err(IoError::Xml("XML start tag is not closed".into()));
+    }
+
+    let self_closing = tag[..tag.len() - 1].trim_end().ends_with('/');
+    let mut open = tag[..tag.len() - 1].trim_end().to_string();
+
+    if open.ends_with('/') {
+        open.pop();
+        open = open.trim_end().to_string();
+    }
+
+    open = remove_attr(&open, name);
+    open.push_str(&format!(r#" {name}="{}""#, xml::esc_attr(value)));
+
+    if self_closing {
+        open.push_str("/>");
+    } else {
+        open.push('>');
+    }
+
+    Ok(open)
+}
+
+fn shift_sheet_data_coordinates(xml: &str, edit: crate::StructuralEdit) -> Result<String, IoError> {
+    let sheet_data_start = xml.find("<sheetData").ok_or_else(|| IoError::Xml("worksheet has no <sheetData> element".into()))?;
+    let sheet_data_tag_end_rel =
+        xml[sheet_data_start..].find('>').ok_or_else(|| IoError::Xml("worksheet has an unterminated <sheetData> element".into()))?;
+    let sheet_data_tag_end = sheet_data_start + sheet_data_tag_end_rel + 1;
+    let sheet_data_start_tag = &xml[sheet_data_start..sheet_data_tag_end];
+
+    if sheet_data_start_tag.trim_end().ends_with("/>") {
+        return Ok(xml.to_string());
+    }
+
+    let sheet_data_close_rel =
+        xml[sheet_data_tag_end..].find("</sheetData>").ok_or_else(|| IoError::Xml("worksheet has no </sheetData> element".into()))?;
+    let sheet_data_close = sheet_data_tag_end + sheet_data_close_rel;
+
+    let row_edit = matches!(edit, crate::StructuralEdit::InsertRows { .. } | crate::StructuralEdit::DeleteRows { .. });
+
+    let bytes = xml.as_bytes();
+    let mut body = String::with_capacity(sheet_data_close - sheet_data_tag_end);
+    let mut pos = sheet_data_tag_end;
+
+    while pos < sheet_data_close {
+        let Some(rel) = xml[pos..sheet_data_close].find("<row") else {
+            body.push_str(&xml[pos..sheet_data_close]);
+            break;
+        };
+
+        let row_start = pos + rel;
+        let after_row = row_start + 4;
+        let next = bytes.get(after_row).copied();
+
+        if !matches!(next, Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') | Some(b'>') | Some(b'/')) {
+            body.push_str(&xml[pos..after_row]);
+            pos = after_row;
+            continue;
+        }
+
+        body.push_str(&xml[pos..row_start]);
+
+        let row_tag_end_rel =
+            xml[row_start..sheet_data_close].find('>').ok_or_else(|| IoError::Xml("worksheet has an unterminated <row> element".into()))?;
+        let row_tag_end = row_start + row_tag_end_rel + 1;
+        let row_start_tag = &xml[row_start..row_tag_end];
+        let row_self_closing = row_start_tag.trim_end().ends_with("/>");
+
+        let row_end = if row_self_closing {
+            row_tag_end
+        } else {
+            let close_rel =
+                xml[row_tag_end..sheet_data_close].find("</row>").ok_or_else(|| IoError::Xml("worksheet row has no </row> element".into()))?;
+            row_tag_end + close_rel + 6
+        };
+
+        let shifted_row = if row_edit {
+            let row_number = attr_value(row_start_tag, "r")
+                .and_then(|value| value.parse::<u32>().ok())
+                .ok_or_else(|| IoError::Format("safe structural XLSX patching requires explicit row numbers".into()))?;
+
+            let row_zero = row_number.checked_sub(1).ok_or_else(|| IoError::Format("worksheet row number cannot be zero".into()))?;
+
+            shifted_cell_ref(CellRef::new(row_zero, 0), edit).map(|c| c.row.saturating_add(1))
+        } else {
+            attr_value(row_start_tag, "r").and_then(|value| value.parse::<u32>().ok())
+        };
+
+        if row_edit && shifted_row.is_none() {
+            pos = row_end;
+            continue;
+        }
+
+        let new_row_start = if row_edit {
+            let Some(row) = shifted_row else {
+                return Err(IoError::Format("safe structural XLSX patching could not resolve shifted row".into()));
+            };
+            set_tag_attr(row_start_tag, "r", &row.to_string())?
+        } else {
+            row_start_tag.to_string()
+        };
+
+        body.push_str(&new_row_start);
+
+        if !row_self_closing {
+            let row_close = row_end - 6;
+            let mut cell_pos = row_tag_end;
+
+            while cell_pos < row_close {
+                let Some(cell_rel) = xml[cell_pos..row_close].find("<c") else {
+                    body.push_str(&xml[cell_pos..row_close]);
+                    break;
+                };
+
+                let cell_start = cell_pos + cell_rel;
+                let after_c = cell_start + 2;
+                let next = bytes.get(after_c).copied();
+
+                if !matches!(next, Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') | Some(b'>') | Some(b'/')) {
+                    body.push_str(&xml[cell_pos..after_c]);
+                    cell_pos = after_c;
+                    continue;
+                }
+
+                body.push_str(&xml[cell_pos..cell_start]);
+
+                let cell_tag_end_rel =
+                    xml[cell_start..row_close].find('>').ok_or_else(|| IoError::Xml("worksheet has an unterminated <c> element".into()))?;
+                let cell_tag_end = cell_start + cell_tag_end_rel + 1;
+                let cell_start_tag = &xml[cell_start..cell_tag_end];
+
+                let cell_end = if cell_start_tag.trim_end().ends_with("/>") {
+                    cell_tag_end
+                } else {
+                    let close_rel =
+                        xml[cell_tag_end..row_close].find("</c>").ok_or_else(|| IoError::Xml("worksheet cell has no </c> element".into()))?;
+                    cell_tag_end + close_rel + 4
+                };
+
+                let a1 = attr_value(cell_start_tag, "r")
+                    .ok_or_else(|| IoError::Format("safe structural XLSX patching requires explicit cell references".into()))?;
+                let cell_ref = CellRef::parse(&a1).ok_or_else(|| IoError::Format(format!("invalid worksheet cell reference {a1}")))?;
+
+                if let Some(new_ref) = shifted_cell_ref(cell_ref, edit) {
+                    let new_start = set_tag_attr(cell_start_tag, "r", &new_ref.a1())?;
+                    body.push_str(&new_start);
+                    body.push_str(&xml[cell_tag_end..cell_end]);
+                }
+
+                cell_pos = cell_end;
+            }
+
+            body.push_str("</row>");
+        }
+
+        pos = row_end;
+    }
+
+    let mut out = String::with_capacity(xml.len() + 64);
+    out.push_str(&xml[..sheet_data_tag_end]);
+    out.push_str(&body);
+    out.push_str(&xml[sheet_data_close..]);
+    Ok(out)
+}
+
+fn structural_sheet_is_plain(sheet: &gridcraft_model::Sheet) -> bool {
+    sheet.rows.is_empty()
+        && sheet.cols.is_empty()
+        && sheet.merges.is_empty()
+        && sheet.cond_formats.is_empty()
+        && sheet.validations.is_empty()
+        && sheet.tables.is_empty()
+        && sheet.autofilter.is_none()
+        && sheet.cell_pictures.is_empty()
+        && sheet.comments.is_empty()
+        && sheet.hyperlinks.is_empty()
+        && sheet.charts.is_empty()
+        && sheet.images.is_empty()
+        && sheet.shapes.is_empty()
+        && sheet.sparklines.is_empty()
+        && sheet.pivots.is_empty()
+}
+
+fn apply_structural_edit_to_baseline(wb: &mut Workbook, edit: crate::StructuralEdit) -> Result<(), IoError> {
+    let (sheet_index, at, count) = match edit {
+        crate::StructuralEdit::InsertRows { sheet, at, count }
+        | crate::StructuralEdit::DeleteRows { sheet, at, count }
+        | crate::StructuralEdit::InsertColumns { sheet, at, count }
+        | crate::StructuralEdit::DeleteColumns { sheet, at, count } => (sheet, at, count),
+    };
+
+    if count == 0 {
+        return Ok(());
+    }
+
+    let sheet = wb.sheet_mut(sheet_index).ok_or_else(|| IoError::Format(format!("structural edit refers to missing sheet {sheet_index}")))?;
+
+    match edit {
+        crate::StructuralEdit::InsertRows { .. } => {
+            sheet.cells.shift_rows(at, count as i64);
+        }
+        crate::StructuralEdit::DeleteRows { .. } => {
+            let end = at.saturating_add(count).saturating_sub(1).min(gridcraft_core::MAX_ROWS - 1);
+            sheet.cells.take_range(gridcraft_core::RangeRef::rows(at, end));
+            sheet.cells.shift_rows(at.saturating_add(count), -(count as i64));
+        }
+        crate::StructuralEdit::InsertColumns { .. } => {
+            sheet.cells.shift_cols(at, count as i64);
+        }
+        crate::StructuralEdit::DeleteColumns { .. } => {
+            let end = at.saturating_add(count).saturating_sub(1).min(gridcraft_core::MAX_COLS - 1);
+            sheet.cells.take_range(gridcraft_core::RangeRef::cols(at, end));
+            sheet.cells.shift_cols(at.saturating_add(count), -(count as i64));
+        }
+    }
+
+    Ok(())
+}
+
+fn structurally_shift_package(original: &[u8], base: &Workbook, edits: &[crate::StructuralEdit]) -> Result<Vec<u8>, IoError> {
+    if edits.is_empty() {
+        return Ok(original.to_vec());
+    }
+
+    let mut pkg = Package::open(original)?;
+
+    let root_rels = pkg.rels("")?;
+    let wb_part = root_rels.iter().find(|r| r.kind == "officeDocument").map(|r| r.target.clone()).unwrap_or_else(|| "xl/workbook.xml".into());
+
+    let wb_xml = pkg.read_xml(&wb_part)?.ok_or_else(|| IoError::Format("no workbook part".into()))?;
+    let wb_rels = pkg.rels(&wb_part)?;
+
+    let mut sheet_parts = Vec::new();
+    if let Some(sheets) = wb_xml.child("sheets") {
+        for sheet in sheets.kids("sheet") {
+            let Some(id) = sheet.attr("id") else {
+                continue;
+            };
+            let Some(rel) = wb_rels.iter().find(|r| r.id == id) else {
+                continue;
+            };
+            if rel.kind == "worksheet" {
+                sheet_parts.push(rel.target.clone());
+            }
+        }
+    }
+
+    let mut by_sheet: BTreeMap<usize, Vec<crate::StructuralEdit>> = BTreeMap::new();
+    for &edit in edits {
+        let sheet_index = match edit {
+            crate::StructuralEdit::InsertRows { sheet, .. }
+            | crate::StructuralEdit::DeleteRows { sheet, .. }
+            | crate::StructuralEdit::InsertColumns { sheet, .. }
+            | crate::StructuralEdit::DeleteColumns { sheet, .. } => sheet,
+        };
+
+        let sheet = base.sheet(sheet_index).ok_or_else(|| IoError::Format(format!("structural edit refers to missing base sheet {sheet_index}")))?;
+
+        if !structural_sheet_is_plain(sheet) {
+            return Err(IoError::Format(format!(
+                "safe structural XLSX patching does not yet support row/column edits on sheets with structural features: {}",
+                sheet.name
+            )));
+        }
+
+        by_sheet.entry(sheet_index).or_default().push(edit);
+    }
+
+    let mut replacements: HashMap<String, Vec<u8>> = HashMap::new();
+
+    for (sheet_index, sheet_edits) in by_sheet {
+        let part = sheet_parts.get(sheet_index).ok_or_else(|| IoError::Format(format!("cannot resolve worksheet part for sheet {sheet_index}")))?;
+
+        let bytes = pkg.read(part)?.ok_or_else(|| IoError::Format(format!("missing worksheet part {part}")))?;
+
+        let mut text = String::from_utf8(bytes).map_err(|_| IoError::Xml(format!("{part} is not UTF-8 XML")))?;
+
+        for edit in sheet_edits {
+            text = shift_sheet_data_coordinates(&text, edit)?;
+        }
+
+        replacements.insert(normalize(part), text.into_bytes());
+    }
+
+    let mut archive = zip::ZipArchive::new(Cursor::new(original)).map_err(|e| IoError::Zip(e.to_string()))?;
+    let mut out = ZipOut::new();
+
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i).map_err(|e| IoError::Zip(e.to_string()))?;
+        let name = file.name().to_string();
+
+        let mut bytes = Vec::with_capacity(file.size() as usize);
+        file.read_to_end(&mut bytes).map_err(|e| IoError::Zip(e.to_string()))?;
+
+        if let Some(replacement) = replacements.get(&normalize(&name)) {
+            out.add(&name, replacement)?;
+        } else {
+            out.add(&name, &bytes)?;
+        }
+    }
+
+    out.finish()
+}
+
+pub fn patch_xlsx_structural(
+    original: &[u8],
+    base: &Workbook,
+    wb: &Workbook,
+    dirty_cells: &[(usize, CellRef)],
+    edits: &[crate::StructuralEdit],
+) -> Result<Vec<u8>, IoError> {
+    if edits.is_empty() {
+        return patch_xlsx(original, base, wb, dirty_cells);
+    }
+
+    if base.sheets.len() != wb.sheets.len() || base.sheets.iter().zip(&wb.sheets).any(|(a, b)| a.name != b.name) {
+        return Err(IoError::Format("safe structural XLSX patching requires the worksheet set to remain unchanged".into()));
+    }
+
+    if base.names != wb.names {
+        return Err(IoError::Format("safe structural XLSX patching does not yet support structural edits that change defined names".into()));
+    }
+
+    let structurally_shifted = structurally_shift_package(original, base, edits)?;
+
+    let mut shifted_base = base.clone();
+    for &edit in edits {
+        apply_structural_edit_to_baseline(&mut shifted_base, edit)?;
+    }
+
+    let mut dirty: BTreeMap<usize, BTreeSet<CellRef>> = BTreeMap::new();
+
+    for &(sheet_index, cell_ref) in dirty_cells {
+        dirty.entry(sheet_index).or_default().insert(cell_ref);
+    }
+
+    for sheet_index in 0..shifted_base.sheets.len() {
+        let before = shifted_base.sheet(sheet_index).ok_or_else(|| IoError::Format(format!("missing shifted base sheet {sheet_index}")))?;
+        let after = wb.sheet(sheet_index).ok_or_else(|| IoError::Format(format!("missing final sheet {sheet_index}")))?;
+
+        for cell_ref in before.cells.diff(&after.cells) {
+            dirty.entry(sheet_index).or_default().insert(cell_ref);
+        }
+    }
+
+    let dirty: Vec<(usize, CellRef)> = dirty.into_iter().flat_map(|(sheet, refs)| refs.into_iter().map(move |cell_ref| (sheet, cell_ref))).collect();
+
+    if dirty.is_empty() { Ok(structurally_shifted) } else { patch_xlsx(&structurally_shifted, &shifted_base, wb, &dirty) }
+}
+
 pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: &[(usize, CellRef)]) -> Result<Vec<u8>, IoError> {
     if dirty_cells.is_empty() {
         return Ok(original.to_vec());
@@ -924,7 +1315,7 @@ mod tests {
     use gridcraft_core::{CellRef, Value};
     use gridcraft_model::{Cell, Formula, NumFmt};
 
-    use super::patch_xlsx;
+    use super::{patch_xlsx, patch_xlsx_structural, shift_sheet_data_coordinates};
     use crate::read_xlsx;
 
     fn at(a1: &str) -> CellRef {
@@ -957,6 +1348,231 @@ mod tests {
         let changed: Vec<_> = before.iter().filter_map(|(name, data)| (after.get(name) != Some(data)).then_some(name.as_str())).collect();
 
         assert_eq!(changed, vec!["xl/worksheets/sheet1.xml"]);
+    }
+
+    #[test]
+    fn structural_insert_column_preserves_package() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c></row></sheetData>"#,
+            &[("xl/preserved.xml", "<preserved>leave me alone</preserved>")],
+            "",
+            "",
+        );
+
+        let (base, _) = read_xlsx(&original).unwrap();
+        let mut wb = base.clone();
+
+        wb.sheet_mut(0).unwrap().cells.shift_cols(1, 1);
+
+        let patched =
+            patch_xlsx_structural(&original, &base, &wb, &[], &[crate::StructuralEdit::InsertColumns { sheet: 0, at: 1, count: 1 }]).unwrap();
+
+        assert_only_sheet_changed(&original, &patched);
+
+        let after = parts(&patched);
+        let sheet = String::from_utf8(after["xl/worksheets/sheet1.xml"].clone()).unwrap();
+
+        assert!(sheet.contains(r#"<c r="A1"><v>1</v></c>"#));
+        assert!(sheet.contains(r#"<c r="C1"><v>2</v></c>"#));
+        assert_eq!(parts(&original)["xl/preserved.xml"], after["xl/preserved.xml"]);
+
+        let (reopened, _) = read_xlsx(&patched).unwrap();
+        assert_eq!(reopened.sheet(0).unwrap().cell(at("C1")).unwrap().value, Value::Number(2.0));
+    }
+
+    #[test]
+    fn structural_delete_column_preserves_package() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c><c r="C1"><v>3</v></c></row></sheetData>"#,
+            &[("xl/preserved.xml", "<preserved>leave me alone</preserved>")],
+            "",
+            "",
+        );
+
+        let (base, _) = read_xlsx(&original).unwrap();
+        let mut wb = base.clone();
+
+        wb.sheet_mut(0).unwrap().cells.take_range(gridcraft_core::RangeRef::cols(1, 1));
+        wb.sheet_mut(0).unwrap().cells.shift_cols(2, -1);
+
+        let patched =
+            patch_xlsx_structural(&original, &base, &wb, &[], &[crate::StructuralEdit::DeleteColumns { sheet: 0, at: 1, count: 1 }]).unwrap();
+
+        assert_only_sheet_changed(&original, &patched);
+
+        let after = parts(&patched);
+        let sheet = String::from_utf8(after["xl/worksheets/sheet1.xml"].clone()).unwrap();
+
+        assert!(sheet.contains(r#"<c r="A1"><v>1</v></c>"#));
+        assert!(sheet.contains(r#"<c r="B1"><v>3</v></c>"#));
+        assert!(!sheet.contains(r#"<v>2</v>"#));
+        assert_eq!(parts(&original)["xl/preserved.xml"], after["xl/preserved.xml"]);
+
+        let (reopened, _) = read_xlsx(&patched).unwrap();
+        assert_eq!(reopened.sheet(0).unwrap().cell(at("B1")).unwrap().value, Value::Number(3.0));
+    }
+
+    #[test]
+    fn structural_delete_row_preserves_package() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row><row r="2"><c r="A2"><v>2</v></c></row><row r="3"><c r="A3"><v>3</v></c></row></sheetData>"#,
+            &[("xl/preserved.xml", "<preserved>leave me alone</preserved>")],
+            "",
+            "",
+        );
+
+        let (base, _) = read_xlsx(&original).unwrap();
+        let mut wb = base.clone();
+
+        wb.sheet_mut(0).unwrap().cells.take_range(gridcraft_core::RangeRef::rows(1, 1));
+        wb.sheet_mut(0).unwrap().cells.shift_rows(2, -1);
+
+        let patched = patch_xlsx_structural(&original, &base, &wb, &[], &[crate::StructuralEdit::DeleteRows { sheet: 0, at: 1, count: 1 }]).unwrap();
+
+        assert_only_sheet_changed(&original, &patched);
+
+        let after = parts(&patched);
+        let sheet = String::from_utf8(after["xl/worksheets/sheet1.xml"].clone()).unwrap();
+
+        assert!(sheet.contains(r#"<row r="1"><c r="A1"><v>1</v></c></row>"#));
+        assert!(sheet.contains(r#"<row r="2"><c r="A2"><v>3</v></c></row>"#));
+        assert!(!sheet.contains(r#"<v>2</v>"#));
+        assert_eq!(parts(&original)["xl/preserved.xml"], after["xl/preserved.xml"]);
+
+        let (reopened, _) = read_xlsx(&patched).unwrap();
+        assert_eq!(reopened.sheet(0).unwrap().cell(at("A2")).unwrap().value, Value::Number(3.0));
+    }
+
+    #[test]
+    fn structural_insert_row_patches_formula_on_other_sheet() {
+        let wb_xml = r#"<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/><sheet name="Calc" sheetId="2" r:id="rId2"/></sheets></workbook>"#;
+        let wb_rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>"#;
+        let sheet1 = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>"#;
+        let sheet2 = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><f>Data!A1+1</f><v>2</v></c></row></sheetData></worksheet>"#;
+
+        let original = crate::tests::make_zip(&[
+            ("[Content_Types].xml", crate::tests::CT.as_bytes()),
+            ("_rels/.rels", crate::tests::ROOT_RELS.as_bytes()),
+            ("xl/workbook.xml", wb_xml.as_bytes()),
+            ("xl/_rels/workbook.xml.rels", wb_rels.as_bytes()),
+            ("xl/worksheets/sheet1.xml", sheet1.as_bytes()),
+            ("xl/worksheets/sheet2.xml", sheet2.as_bytes()),
+            ("xl/preserved.xml", b"<preserved>leave me alone</preserved>"),
+        ]);
+
+        let (base, _) = read_xlsx(&original).unwrap();
+        let mut wb = base.clone();
+
+        wb.sheet_mut(0).unwrap().cells.shift_rows(0, 1);
+
+        let mut formula_cell = wb.sheet(1).unwrap().cell(at("A1")).unwrap().clone();
+        formula_cell.formula = Some(Formula::new("Data!A2+1").into());
+        wb.sheet_mut(1).unwrap().set_cell(at("A1"), formula_cell);
+
+        let patched = patch_xlsx_structural(&original, &base, &wb, &[], &[crate::StructuralEdit::InsertRows { sheet: 0, at: 0, count: 1 }]).unwrap();
+
+        let before = parts(&original);
+        let after = parts(&patched);
+
+        let changed: Vec<_> = before.iter().filter_map(|(name, data)| (after.get(name) != Some(data)).then_some(name.as_str())).collect();
+
+        assert_eq!(changed, vec!["xl/worksheets/sheet1.xml", "xl/worksheets/sheet2.xml"]);
+        assert_eq!(before["xl/preserved.xml"], after["xl/preserved.xml"]);
+
+        let (reopened, _) = read_xlsx(&patched).unwrap();
+        assert_eq!(reopened.sheet(0).unwrap().cell(at("A2")).unwrap().value, Value::Number(1.0));
+        assert_eq!(reopened.sheet(1).unwrap().cell(at("A1")).unwrap().formula.as_ref().unwrap().text, "Data!A2+1");
+    }
+
+    #[test]
+    fn structural_insert_row_patches_rewritten_formula() {
+        let original = fixture();
+        let (base, _) = read_xlsx(&original).unwrap();
+        let mut wb = base.clone();
+
+        wb.sheet_mut(0).unwrap().cells.shift_rows(0, 1);
+
+        let mut moved = wb.sheet(0).unwrap().cell(at("B2")).unwrap().clone();
+        moved.formula = Some(Formula::new("A2+1").into());
+        wb.sheet_mut(0).unwrap().set_cell(at("B2"), moved);
+
+        let patched = patch_xlsx_structural(&original, &base, &wb, &[], &[crate::StructuralEdit::InsertRows { sheet: 0, at: 0, count: 1 }]).unwrap();
+
+        assert_only_sheet_changed(&original, &patched);
+
+        let after = parts(&patched);
+        let sheet = String::from_utf8(after["xl/worksheets/sheet1.xml"].clone()).unwrap();
+
+        assert!(sheet.contains(r#"<c r="B2"><f>A2+1</f><v>2</v></c>"#));
+
+        let (reopened, _) = read_xlsx(&patched).unwrap();
+        assert_eq!(reopened.sheet(0).unwrap().cell(at("B2")).unwrap().formula.as_ref().unwrap().text, "A2+1");
+    }
+
+    #[test]
+    fn structural_insert_row_preserves_package() {
+        let original = fixture();
+        let (base, _) = read_xlsx(&original).unwrap();
+        let mut wb = base.clone();
+
+        wb.sheet_mut(0).unwrap().cells.shift_rows(0, 1);
+
+        let patched = patch_xlsx_structural(&original, &base, &wb, &[], &[crate::StructuralEdit::InsertRows { sheet: 0, at: 0, count: 1 }]).unwrap();
+
+        assert_only_sheet_changed(&original, &patched);
+
+        let after = parts(&patched);
+        let sheet = String::from_utf8(after["xl/worksheets/sheet1.xml"].clone()).unwrap();
+
+        assert!(sheet.contains(r#"<row r="2"><c r="A2"><v>1</v></c><c r="B2"><f>A1+1</f><v>2</v></c></row>"#));
+        assert_eq!(parts(&original)["xl/preserved.xml"], after["xl/preserved.xml"]);
+
+        let (reopened, _) = read_xlsx(&patched).unwrap();
+        assert_eq!(reopened.sheet(0).unwrap().cell(at("A2")).unwrap().value, Value::Number(1.0));
+    }
+
+    #[test]
+    fn structural_coordinate_shift_insert_rows() {
+        let xml = r#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row><row r="2"><c r="B2"><v>2</v></c></row></sheetData></worksheet>"#;
+
+        let shifted = shift_sheet_data_coordinates(xml, crate::StructuralEdit::InsertRows { sheet: 0, at: 1, count: 2 }).unwrap();
+
+        assert!(shifted.contains(r#"<row r="1"><c r="A1"><v>1</v></c></row>"#));
+        assert!(shifted.contains(r#"<row r="4"><c r="B4"><v>2</v></c></row>"#));
+        assert!(!shifted.contains(r#"r="2""#));
+    }
+
+    #[test]
+    fn structural_coordinate_shift_delete_rows() {
+        let xml = r#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row><row r="2"><c r="B2"><v>2</v></c></row><row r="3"><c r="C3"><v>3</v></c></row></sheetData></worksheet>"#;
+
+        let shifted = shift_sheet_data_coordinates(xml, crate::StructuralEdit::DeleteRows { sheet: 0, at: 1, count: 1 }).unwrap();
+
+        assert!(shifted.contains(r#"<row r="1"><c r="A1"><v>1</v></c></row>"#));
+        assert!(!shifted.contains(r#"<v>2</v>"#));
+        assert!(shifted.contains(r#"<row r="2"><c r="C2"><v>3</v></c></row>"#));
+    }
+
+    #[test]
+    fn structural_coordinate_shift_insert_columns() {
+        let xml = r#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c></row></sheetData></worksheet>"#;
+
+        let shifted = shift_sheet_data_coordinates(xml, crate::StructuralEdit::InsertColumns { sheet: 0, at: 1, count: 2 }).unwrap();
+
+        assert!(shifted.contains(r#"<c r="A1"><v>1</v></c>"#));
+        assert!(shifted.contains(r#"<c r="D1"><v>2</v></c>"#));
+    }
+
+    #[test]
+    fn structural_coordinate_shift_delete_columns() {
+        let xml =
+            r#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c><c r="C1"><v>3</v></c></row></sheetData></worksheet>"#;
+
+        let shifted = shift_sheet_data_coordinates(xml, crate::StructuralEdit::DeleteColumns { sheet: 0, at: 1, count: 1 }).unwrap();
+
+        assert!(shifted.contains(r#"<c r="A1"><v>1</v></c>"#));
+        assert!(!shifted.contains(r#"<v>2</v>"#));
+        assert!(shifted.contains(r#"<c r="B1"><v>3</v></c>"#));
     }
 
     fn fixture() -> Vec<u8> {

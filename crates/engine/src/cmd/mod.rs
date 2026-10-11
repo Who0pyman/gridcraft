@@ -230,6 +230,7 @@ pub struct Ctx<'a> {
     pub wb: Workbook,
     pub changed: Vec<Key>,
     pub structural: bool,
+    pub xlsx_structural_edits: Vec<gridcraft_xlsx::StructuralEdit>,
     pub sel: &'a mut Selection,
     /// Rows whose automatic height should be recomputed (sheet, row).
     pub fit_rows: Vec<(usize, u32)>,
@@ -253,9 +254,17 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
     #[allow(clippy::disallowed_methods)]
     let t0 = if cfg!(target_arch = "wasm32") { None } else { std::env::var_os("GRIDCRAFT_PROFILE").map(|_| std::time::Instant::now()) };
     let mut sel = d.selection.clone();
-    let mut ctx = Ctx { wb: (*d.wb).clone(), changed: Vec::new(), structural: false, sel: &mut sel, fit_rows: Vec::new(), protection_checked: false };
+    let mut ctx = Ctx {
+        wb: (*d.wb).clone(),
+        changed: Vec::new(),
+        structural: false,
+        xlsx_structural_edits: Vec::new(),
+        sel: &mut sel,
+        fit_rows: Vec::new(),
+        protection_checked: false,
+    };
     let r = f(&mut ctx)?;
-    let Ctx { mut wb, changed, structural, mut fit_rows, protection_checked, .. } = ctx;
+    let Ctx { mut wb, changed, structural, xlsx_structural_edits, mut fit_rows, protection_checked, .. } = ctx;
     if !protection_checked {
         check_protection(&d.wb, &wb)?;
     }
@@ -287,7 +296,11 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
     if d.original_xlsx.is_some() {
         d.xlsx_dirty_cells.extend(changed.iter().cloned());
         if structural {
-            d.xlsx_structural_dirty = true;
+            if xlsx_structural_edits.is_empty() {
+                d.xlsx_structural_dirty = true;
+            } else {
+                d.xlsx_structural_edits.extend(xlsx_structural_edits);
+            }
         }
     }
 

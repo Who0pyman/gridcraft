@@ -98,8 +98,16 @@ fn save(s: &mut Session, p: &Json) -> Result<Json> {
     let bytes = if matches!(kind, crate::io::FileKind::Xlsx) {
         match &d.original_xlsx {
             Some(original) if !d.is_dirty() => original.clone(),
-            Some(original) if !d.xlsx_structural_dirty => gridcraft_xlsx::patch_xlsx(original, &d.saved, &d.wb, &d.xlsx_dirty_cells)
-                .map_err(|e| EngineError::Other(format!("Safe XLSX patch save failed: {e}")))?,
+            Some(original) if !d.xlsx_structural_dirty && d.xlsx_structural_edits.is_empty() => {
+                gridcraft_xlsx::patch_xlsx(original, &d.saved, &d.wb, &d.xlsx_dirty_cells)
+                    .map_err(|e| EngineError::Other(format!("Safe XLSX patch save failed: {e}")))?
+            }
+            Some(original) if !d.xlsx_structural_dirty => {
+                match gridcraft_xlsx::patch_xlsx_structural(original, &d.saved, &d.wb, &d.xlsx_dirty_cells, &d.xlsx_structural_edits) {
+                    Ok(bytes) => bytes,
+                    Err(_) => crate::io::save_bytes(&d.wb, &path)?,
+                }
+            }
             _ => crate::io::save_bytes(&d.wb, &path)?,
         }
     } else {
@@ -116,11 +124,13 @@ fn save(s: &mut Session, p: &Json) -> Result<Json> {
         if matches!(kind, crate::io::FileKind::Xlsx) {
             d.original_xlsx = Some(bytes.clone());
             d.xlsx_dirty_cells.clear();
+            d.xlsx_structural_edits.clear();
             d.xlsx_structural_dirty = false;
         } else {
             // A JSON save no longer has an XLSX package that corresponds to `saved`.
             d.original_xlsx = None;
             d.xlsx_dirty_cells.clear();
+            d.xlsx_structural_edits.clear();
             d.xlsx_structural_dirty = false;
         }
     }

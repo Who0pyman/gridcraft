@@ -98,7 +98,9 @@ pub struct DocState {
     pub original_xlsx: Option<Vec<u8>>,
     /// Cells edited since the original XLSX package was loaded/saved.
     pub xlsx_dirty_cells: Vec<gridcraft_calc::Key>,
-    /// True when rows, columns, or sheets were structurally changed.
+    /// Structural worksheet edits that can be patched into the original XLSX package.
+    pub xlsx_structural_edits: Vec<gridcraft_xlsx::StructuralEdit>,
+    /// True when an unsupported structural change requires the full XLSX writer.
     pub xlsx_structural_dirty: bool,
     /// Per-sheet selection memory.
     pub sheet_selections: Vec<Selection>,
@@ -126,6 +128,7 @@ impl DocState {
             title,
             original_xlsx: None,
             xlsx_dirty_cells: vec![],
+            xlsx_structural_edits: vec![],
             xlsx_structural_dirty: false,
             sheet_selections: vec![],
         }
