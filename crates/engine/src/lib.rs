@@ -96,6 +96,10 @@ pub struct DocState {
     pub title: String,
     /// Original XLSX package bytes, preserved for lossless round-tripping.
     pub original_xlsx: Option<Vec<u8>>,
+    /// Cells edited since the original XLSX package was loaded/saved.
+    pub xlsx_dirty_cells: Vec<gridcraft_calc::Key>,
+    /// True when rows, columns, or sheets were structurally changed.
+    pub xlsx_structural_dirty: bool,
     /// Per-sheet selection memory.
     pub sheet_selections: Vec<Selection>,
 }
@@ -121,6 +125,8 @@ impl DocState {
             uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             title,
             original_xlsx: None,
+            xlsx_dirty_cells: vec![],
+            xlsx_structural_dirty: false,
             sheet_selections: vec![],
         }
     }

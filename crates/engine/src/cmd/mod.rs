@@ -281,6 +281,16 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
     if let Some(t0) = t0 {
         eprintln!("commit: + rows {:?}", t0.elapsed());
     }
+    // ORGrid: remember precisely which XLSX cells were edited.
+    // This lets edited saves patch only those cells into the original
+    // Excel package instead of rebuilding the entire workbook.
+    if d.original_xlsx.is_some() {
+        d.xlsx_dirty_cells.extend(changed.iter().cloned());
+        if structural {
+            d.xlsx_structural_dirty = true;
+        }
+    }
+
     d.wb = std::sync::Arc::new(wb);
     d.selection = sel;
     Ok(r)
