@@ -145,13 +145,22 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
             let a1 = cell_ref.a1();
 
             let Some((start, end, start_tag_end)) = find_cell_span(&text, &a1) else {
-                if old_formula.is_some() || new_formula.is_some() {
-                    return Err(IoError::Format(format!("safe XLSX patching does not yet support creating a formula at {}!{}", sheet.name, a1)));
+                if old_formula.is_some() {
+                    return Err(IoError::Format(format!(
+                        "safe XLSX patching found a modeled formula with no original cell at {}!{}",
+                        sheet.name, a1
+                    )));
                 }
 
-                let value = new_cell.map(|cell| cell.value.scalar()).unwrap_or(Value::Empty);
                 let synthetic = format!(r#"<c r="{a1}"/>"#);
-                let (replacement, new_shared) = write_constant_cell(&synthetic, &value, &mut sst)?;
+
+                let (replacement, new_shared) = if let Some(formula) = new_formula {
+                    let raw_value = new_cell.map(|cell| &cell.value).unwrap_or(&Value::Empty);
+                    (write_formula_cell(&synthetic, formula, raw_value)?, false)
+                } else {
+                    let value = new_cell.map(|cell| cell.value.scalar()).unwrap_or(Value::Empty);
+                    write_constant_cell(&synthetic, &value, &mut sst)?
+                };
 
                 if new_shared {
                     sst.count_changed = true;
@@ -173,11 +182,10 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
                     let raw_value = new_cell.map(|cell| &cell.value).unwrap_or(&Value::Empty);
                     (write_formula_cell(original_cell, formula, raw_value)?, false)
                 }
-                (Some(_), None) => {
-                    return Err(IoError::Format(format!("safe XLSX patching does not yet support removing a formula at {}!{}", sheet.name, a1)));
-                }
-                (None, Some(_)) => {
-                    return Err(IoError::Format(format!("safe XLSX patching does not yet support creating a formula at {}!{}", sheet.name, a1)));
+                (Some(_), None) => write_constant_cell(original_cell, &value, &mut sst)?,
+                (None, Some(formula)) => {
+                    let raw_value = new_cell.map(|cell| &cell.value).unwrap_or(&Value::Empty);
+                    (write_formula_cell(original_cell, formula, raw_value)?, false)
                 }
                 (None, None) => write_constant_cell(original_cell, &value, &mut sst)?,
             };
@@ -241,14 +249,15 @@ fn write_formula_cell(original_cell: &str, formula: &gridcraft_model::Formula, v
         return Err(IoError::Format("safe XLSX patching does not yet support array or dynamic formula edits".into()));
     }
 
-    let formula_start = original_cell.find("<f").ok_or_else(|| IoError::Xml("formula cell has no <f> element".into()))?;
-    let formula_tag_end_rel =
-        original_cell[formula_start..].find('>').ok_or_else(|| IoError::Xml("formula element start tag is not closed".into()))?;
-    let formula_tag_end = formula_start + formula_tag_end_rel;
-    let formula_start_tag = &original_cell[formula_start..=formula_tag_end];
+    if let Some(formula_start) = original_cell.find("<f") {
+        let formula_tag_end_rel =
+            original_cell[formula_start..].find('>').ok_or_else(|| IoError::Xml("formula element start tag is not closed".into()))?;
+        let formula_tag_end = formula_start + formula_tag_end_rel;
+        let formula_start_tag = &original_cell[formula_start..=formula_tag_end];
 
-    if formula_start_tag.trim() != "<f>" {
-        return Err(IoError::Format("safe XLSX patching does not yet support shared, array, or attributed formula elements".into()));
+        if formula_start_tag.trim() != "<f>" {
+            return Err(IoError::Format("safe XLSX patching does not yet support shared, array, or attributed formula elements".into()));
+        }
     }
 
     let mut open = original_start[..original_start.len() - 1].trim_end().to_string();
@@ -706,6 +715,63 @@ mod tests {
 
         let (reopened, _) = read_xlsx(&patched).unwrap();
         assert_eq!(reopened.sheet(0).unwrap().value(at("A3")), Value::Text("new row".into()));
+    }
+
+    #[test]
+    fn constant_cell_can_become_formula() {
+        let original = fixture();
+        let (base, _) = read_xlsx(&original).unwrap();
+        let mut wb = base.clone();
+
+        let style = wb.sheet(0).unwrap().style_id(at("A1"));
+        wb.sheet_mut(0).unwrap().set_cell(at("A1"), Cell { value: Value::Number(4.0), formula: Some(Arc::new(Formula::new("=2+2"))), style });
+
+        let patched = patch_xlsx(&original, &base, &wb, &[(0, at("A1"))]).unwrap();
+        assert_only_sheet_changed(&original, &patched);
+
+        let (reopened, _) = read_xlsx(&patched).unwrap();
+        let cell = reopened.sheet(0).unwrap().cell(at("A1")).unwrap();
+
+        assert_eq!(cell.formula.as_ref().unwrap().text, "2+2");
+        assert_eq!(cell.value, Value::Number(4.0));
+    }
+
+    #[test]
+    fn formula_cell_can_become_constant() {
+        let original = fixture();
+        let (base, _) = read_xlsx(&original).unwrap();
+        let mut wb = base.clone();
+
+        wb.sheet_mut(0).unwrap().set_value(at("B1"), Value::Number(7.0));
+
+        let patched = patch_xlsx(&original, &base, &wb, &[(0, at("B1"))]).unwrap();
+        assert_only_sheet_changed(&original, &patched);
+
+        let (reopened, _) = read_xlsx(&patched).unwrap();
+        let cell = reopened.sheet(0).unwrap().cell(at("B1")).unwrap();
+
+        assert!(cell.formula.is_none());
+        assert_eq!(cell.value, Value::Number(7.0));
+    }
+
+    #[test]
+    fn new_cell_can_be_formula() {
+        let original = fixture();
+        let (base, _) = read_xlsx(&original).unwrap();
+        let mut wb = base.clone();
+
+        wb.sheet_mut(0)
+            .unwrap()
+            .set_cell(at("C1"), Cell { value: Value::Number(2.0), formula: Some(Arc::new(Formula::new("=A1+1"))), style: Default::default() });
+
+        let patched = patch_xlsx(&original, &base, &wb, &[(0, at("C1"))]).unwrap();
+        assert_only_sheet_changed(&original, &patched);
+
+        let (reopened, _) = read_xlsx(&patched).unwrap();
+        let cell = reopened.sheet(0).unwrap().cell(at("C1")).unwrap();
+
+        assert_eq!(cell.formula.as_ref().unwrap().text, "A1+1");
+        assert_eq!(cell.value, Value::Number(2.0));
     }
 
     #[test]
