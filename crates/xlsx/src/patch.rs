@@ -478,3 +478,94 @@ fn remove_attr(tag: &str, wanted: &str) -> String {
 
     tag.to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::io::{Cursor, Read};
+    use std::sync::Arc;
+
+    use gridcraft_core::{CellRef, Value};
+    use gridcraft_model::{Cell, Formula};
+
+    use super::patch_xlsx;
+    use crate::read_xlsx;
+
+    fn at(a1: &str) -> CellRef {
+        CellRef::parse(a1).unwrap()
+    }
+
+    fn parts(bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut out = BTreeMap::new();
+
+        for i in 0..zip.len() {
+            let mut file = zip.by_index(i).unwrap();
+            if file.is_dir() {
+                continue;
+            }
+            let mut data = Vec::new();
+            file.read_to_end(&mut data).unwrap();
+            out.insert(file.name().to_string(), data);
+        }
+
+        out
+    }
+
+    fn assert_only_sheet_changed(before: &[u8], after: &[u8]) {
+        let before = parts(before);
+        let after = parts(after);
+
+        assert_eq!(before.keys().collect::<Vec<_>>(), after.keys().collect::<Vec<_>>());
+
+        let changed: Vec<_> = before.iter().filter_map(|(name, data)| (after.get(name) != Some(data)).then_some(name.as_str())).collect();
+
+        assert_eq!(changed, vec!["xl/worksheets/sheet1.xml"]);
+    }
+
+    fn fixture() -> Vec<u8> {
+        crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><f>A1+1</f><v>2</v></c></row></sheetData>"#,
+            &[("xl/preserved.xml", "<preserved>leave me alone</preserved>")],
+            "",
+            "",
+        )
+    }
+
+    #[test]
+    fn constant_edit_changes_only_its_worksheet_part() {
+        let original = fixture();
+        let (base, _) = read_xlsx(&original).unwrap();
+        let mut wb = base.clone();
+
+        wb.sheet_mut(0).unwrap().set_value(at("A1"), Value::Number(9.0));
+
+        let patched = patch_xlsx(&original, &base, &wb, &[(0, at("A1"))]).unwrap();
+
+        assert_only_sheet_changed(&original, &patched);
+
+        let (reopened, _) = read_xlsx(&patched).unwrap();
+        assert_eq!(reopened.sheet(0).unwrap().value(at("A1")), Value::Number(9.0));
+    }
+
+    #[test]
+    fn ordinary_formula_edit_changes_only_its_worksheet_part() {
+        let original = fixture();
+        let (base, _) = read_xlsx(&original).unwrap();
+        let mut wb = base.clone();
+
+        let sheet = wb.sheet_mut(0).unwrap();
+        let style = sheet.style_id(at("B1"));
+        sheet.set_cell(at("B1"), Cell { value: Value::Number(3.0), formula: Some(Arc::new(Formula::new("=A1+2"))), style });
+
+        let patched = patch_xlsx(&original, &base, &wb, &[(0, at("B1"))]).unwrap();
+
+        assert_only_sheet_changed(&original, &patched);
+
+        let (reopened, _) = read_xlsx(&patched).unwrap();
+        let cell = reopened.sheet(0).unwrap().cell(at("B1")).unwrap();
+
+        assert_eq!(cell.formula.as_ref().unwrap().text, "A1+2");
+        assert_eq!(cell.value, Value::Number(3.0));
+    }
+}
