@@ -88,6 +88,12 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
 
     let mut sst = PatchSst::load(&mut pkg, sst_part)?;
 
+    let original_xfs = if let Some(part) = wb_rels.iter().find(|r| r.kind == "styles").map(|r| r.target.clone()) {
+        pkg.read_xml(&part)?.map(|root| crate::styles::read_styles(&root).xfs)
+    } else {
+        None
+    };
+
     let mut dirty_by_sheet: BTreeMap<usize, BTreeSet<CellRef>> = BTreeMap::new();
     for &(sheet_index, cell_ref) in dirty_cells {
         dirty_by_sheet.entry(sheet_index).or_default().insert(cell_ref);
@@ -122,14 +128,31 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
         for cell_ref in refs {
             let old_style = base_sheet.style_id(cell_ref);
             let new_style = sheet.style_id(cell_ref);
-            if old_style != new_style {
-                return Err(IoError::Format(format!("safe XLSX patching does not yet support style changes at {}!{}", sheet.name, cell_ref.a1())));
-            }
+
+            let style_index = if old_style != new_style {
+                if new_style.0 == 0 {
+                    Some(0)
+                } else {
+                    let xfs = original_xfs.as_ref().ok_or_else(|| {
+                        IoError::Format(format!(
+                            "safe XLSX patching cannot apply a non-default style without an original styles part at {}!{}",
+                            sheet.name,
+                            cell_ref.a1()
+                        ))
+                    })?;
+                    let target = wb.styles.get(new_style);
+                    Some(xfs.iter().position(|style| style == target).ok_or_else(|| {
+                        IoError::Format(format!("safe XLSX patching does not yet support creating a new style at {}!{}", sheet.name, cell_ref.a1()))
+                    })? as u32)
+                }
+            } else {
+                None
+            };
 
             let old_cell = base_sheet.cell(cell_ref);
             let new_cell = sheet.cell(cell_ref);
 
-            if old_cell == new_cell {
+            if old_cell == new_cell && style_index.is_none() {
                 continue;
             }
 
@@ -138,7 +161,7 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
 
             // A dependent formula may have received a new cached result after recalculation.
             // Preserve an unchanged formula cell exactly; Excel can recalculate it.
-            if old_formula.is_some() && old_formula == new_formula {
+            if old_formula.is_some() && old_formula == new_formula && style_index.is_none() {
                 continue;
             }
 
@@ -154,13 +177,17 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
 
                 let synthetic = format!(r#"<c r="{a1}"/>"#);
 
-                let (replacement, new_shared) = if let Some(formula) = new_formula {
+                let (mut replacement, new_shared) = if let Some(formula) = new_formula {
                     let raw_value = new_cell.map(|cell| &cell.value).unwrap_or(&Value::Empty);
                     (write_formula_cell(&synthetic, formula, raw_value)?, false)
                 } else {
                     let value = new_cell.map(|cell| cell.value.scalar()).unwrap_or(Value::Empty);
                     write_constant_cell(&synthetic, &value, &mut sst)?
                 };
+
+                if let Some(style_index) = style_index {
+                    replacement = set_cell_style(&replacement, style_index)?;
+                }
 
                 if new_shared {
                     sst.count_changed = true;
@@ -171,13 +198,22 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
             };
 
             let original_cell = &text[start..end];
+
+            if let Some(style_index) = style_index
+                && old_formula == new_formula
+                && (old_formula.is_some() || old_cell.map(|cell| &cell.value) == new_cell.map(|cell| &cell.value))
+            {
+                edits.push(Edit { start, end, replacement: set_cell_style(original_cell, style_index)? });
+                continue;
+            }
+
             let original_start = &text[start..start_tag_end];
             let old_type = attr_value(original_start, "t");
             let old_shared = old_type.as_deref() == Some("s");
 
             let value = new_cell.map(|cell| cell.value.scalar()).unwrap_or(Value::Empty);
 
-            let (replacement, new_shared) = match (old_formula, new_formula) {
+            let (mut replacement, new_shared) = match (old_formula, new_formula) {
                 (Some(_), Some(formula)) => {
                     let raw_value = new_cell.map(|cell| &cell.value).unwrap_or(&Value::Empty);
                     (write_formula_cell(original_cell, formula, raw_value)?, false)
@@ -189,6 +225,10 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
                 }
                 (None, None) => write_constant_cell(original_cell, &value, &mut sst)?,
             };
+
+            if let Some(style_index) = style_index {
+                replacement = set_cell_style(&replacement, style_index)?;
+            }
 
             if old_shared != new_shared {
                 sst.count_changed = true;
@@ -239,6 +279,34 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
     }
 
     out.finish()
+}
+
+fn set_cell_style(cell: &str, style_index: u32) -> Result<String, IoError> {
+    let tag_end = cell.find('>').ok_or_else(|| IoError::Xml("cell start tag is not closed".into()))?;
+    let start = &cell[..=tag_end];
+    let self_closing = start[..start.len() - 1].trim_end().ends_with('/');
+
+    let mut open = start[..start.len() - 1].trim_end().to_string();
+    if open.ends_with('/') {
+        open.pop();
+        open = open.trim_end().to_string();
+    }
+
+    open = remove_attr(&open, "s");
+
+    if style_index != 0 {
+        open.push_str(&format!(r#" s="{style_index}""#));
+    }
+
+    let mut out = String::with_capacity(cell.len() + 16);
+    out.push_str(&open);
+    if self_closing {
+        out.push_str("/>");
+    } else {
+        out.push('>');
+    }
+    out.push_str(&cell[tag_end + 1..]);
+    Ok(out)
 }
 
 fn write_formula_cell(original_cell: &str, formula: &gridcraft_model::Formula, value: &Value) -> Result<String, IoError> {
@@ -667,6 +735,46 @@ mod tests {
             "",
             "",
         )
+    }
+
+    fn styled_fixture() -> Vec<u8> {
+        let styles = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font/><font><b/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border/></borders><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" applyFont="1"/></cellXfs></styleSheet>"#;
+        let rels =
+            r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>"#;
+
+        crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1" s="1"><v>1</v></c><c r="B1"><f>A1+1</f><v>2</v></c></row></sheetData>"#,
+            &[("xl/styles.xml", styles), ("xl/preserved.xml", "<preserved>leave me alone</preserved>")],
+            rels,
+            "",
+        )
+    }
+
+    #[test]
+    fn existing_style_change_only_updates_cell_style_attribute() {
+        let original = styled_fixture();
+        let (base, _) = read_xlsx(&original).unwrap();
+        let mut wb = base.clone();
+
+        let bold = wb.sheet(0).unwrap().style_id(at("A1"));
+        let formula = wb.sheet(0).unwrap().cell(at("B1")).unwrap().clone();
+
+        wb.sheet_mut(0).unwrap().set_cell(at("B1"), Cell { style: bold, ..formula });
+
+        let patched = patch_xlsx(&original, &base, &wb, &[(0, at("B1"))]).unwrap();
+
+        assert_only_sheet_changed(&original, &patched);
+
+        let before = parts(&original);
+        let after = parts(&patched);
+        let before_sheet = String::from_utf8(before["xl/worksheets/sheet1.xml"].clone()).unwrap();
+        let after_sheet = String::from_utf8(after["xl/worksheets/sheet1.xml"].clone()).unwrap();
+
+        assert!(before_sheet.contains(r#"<c r="B1"><f>A1+1</f><v>2</v></c>"#));
+        assert!(after_sheet.contains(r#"<c r="B1" s="1"><f>A1+1</f><v>2</v></c>"#));
+
+        let (reopened, _) = read_xlsx(&patched).unwrap();
+        assert_eq!(reopened.sheet(0).unwrap().style_id(at("B1")), reopened.sheet(0).unwrap().style_id(at("A1")));
     }
 
     #[test]
