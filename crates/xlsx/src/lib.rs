@@ -91,6 +91,7 @@ pub enum StructuralEdit {
     DeleteCellsLeft { sheet: usize, start_row: u32, end_row: u32, at_col: u32, count: u32 },
     InsertCellsDown { sheet: usize, start_col: u32, end_col: u32, at_row: u32, count: u32 },
     DeleteCellsUp { sheet: usize, start_col: u32, end_col: u32, at_row: u32, count: u32 },
+    RenameSheet { sheet: usize },
 }
 
 /// Patches non-structural cell edits into the original XLSX package.

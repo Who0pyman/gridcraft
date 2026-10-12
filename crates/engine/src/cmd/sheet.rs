@@ -587,6 +587,7 @@ fn rename_sheet(s: &mut Session, p: &Json) -> Result<Json> {
                 n.formula = gridcraft_formula::print(&gridcraft_formula::adjust::rename_sheet(e, &old, &name));
             }
         }
+        cx.xlsx_structural_edits.push(gridcraft_xlsx::StructuralEdit::RenameSheet { sheet: i });
         cx.structural = true;
         Ok(Json::Null)
     })
