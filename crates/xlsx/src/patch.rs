@@ -329,6 +329,10 @@ fn shifted_cell_ref(cell: CellRef, edit: crate::StructuralEdit) -> Option<CellRe
                 Some(cell)
             }
         }
+        crate::StructuralEdit::InsertCellsRight { .. }
+        | crate::StructuralEdit::DeleteCellsLeft { .. }
+        | crate::StructuralEdit::InsertCellsDown { .. }
+        | crate::StructuralEdit::DeleteCellsUp { .. } => Some(cell),
     }
 }
 
@@ -518,36 +522,51 @@ fn structural_sheet_is_plain(sheet: &gridcraft_model::Sheet) -> bool {
 }
 
 fn apply_structural_edit_to_baseline(wb: &mut Workbook, edit: crate::StructuralEdit) -> Result<(), IoError> {
-    let (sheet_index, at, count) = match edit {
-        crate::StructuralEdit::InsertRows { sheet, at, count }
-        | crate::StructuralEdit::DeleteRows { sheet, at, count }
-        | crate::StructuralEdit::InsertColumns { sheet, at, count }
-        | crate::StructuralEdit::DeleteColumns { sheet, at, count } => (sheet, at, count),
+    let sheet_index = match edit {
+        crate::StructuralEdit::InsertRows { sheet, .. }
+        | crate::StructuralEdit::DeleteRows { sheet, .. }
+        | crate::StructuralEdit::InsertColumns { sheet, .. }
+        | crate::StructuralEdit::DeleteColumns { sheet, .. }
+        | crate::StructuralEdit::InsertCellsRight { sheet, .. }
+        | crate::StructuralEdit::DeleteCellsLeft { sheet, .. }
+        | crate::StructuralEdit::InsertCellsDown { sheet, .. }
+        | crate::StructuralEdit::DeleteCellsUp { sheet, .. } => sheet,
     };
-
-    if count == 0 {
-        return Ok(());
-    }
 
     let sheet = wb.sheet_mut(sheet_index).ok_or_else(|| IoError::Format(format!("structural edit refers to missing sheet {sheet_index}")))?;
 
     match edit {
-        crate::StructuralEdit::InsertRows { .. } => {
-            sheet.cells.shift_rows(at, count as i64);
+        crate::StructuralEdit::InsertRows { at, count, .. } => {
+            if count != 0 {
+                sheet.cells.shift_rows(at, count as i64);
+            }
         }
-        crate::StructuralEdit::DeleteRows { .. } => {
-            let end = at.saturating_add(count).saturating_sub(1).min(gridcraft_core::MAX_ROWS - 1);
-            sheet.cells.take_range(gridcraft_core::RangeRef::rows(at, end));
-            sheet.cells.shift_rows(at.saturating_add(count), -(count as i64));
+        crate::StructuralEdit::DeleteRows { at, count, .. } => {
+            if count != 0 {
+                let end = at.saturating_add(count).saturating_sub(1).min(gridcraft_core::MAX_ROWS - 1);
+                sheet.cells.take_range(gridcraft_core::RangeRef::rows(at, end));
+                sheet.cells.shift_rows(at.saturating_add(count), -(count as i64));
+            }
         }
-        crate::StructuralEdit::InsertColumns { .. } => {
-            sheet.cells.shift_cols(at, count as i64);
+        crate::StructuralEdit::InsertColumns { at, count, .. } => {
+            if count != 0 {
+                sheet.cells.shift_cols(at, count as i64);
+            }
         }
-        crate::StructuralEdit::DeleteColumns { .. } => {
-            let end = at.saturating_add(count).saturating_sub(1).min(gridcraft_core::MAX_COLS - 1);
-            sheet.cells.take_range(gridcraft_core::RangeRef::cols(at, end));
-            sheet.cells.shift_cols(at.saturating_add(count), -(count as i64));
+        crate::StructuralEdit::DeleteColumns { at, count, .. } => {
+            if count != 0 {
+                let end = at.saturating_add(count).saturating_sub(1).min(gridcraft_core::MAX_COLS - 1);
+                sheet.cells.take_range(gridcraft_core::RangeRef::cols(at, end));
+                sheet.cells.shift_cols(at.saturating_add(count), -(count as i64));
+            }
         }
+        // Partial-cell shifts are intentionally NOT applied to the baseline here.
+        // Their package XML is likewise left in place, so the final model diff
+        // patches every changed source/destination cell against the original layout.
+        crate::StructuralEdit::InsertCellsRight { .. }
+        | crate::StructuralEdit::DeleteCellsLeft { .. }
+        | crate::StructuralEdit::InsertCellsDown { .. }
+        | crate::StructuralEdit::DeleteCellsUp { .. } => {}
     }
 
     Ok(())
@@ -587,7 +606,11 @@ fn structurally_shift_package(original: &[u8], base: &Workbook, edits: &[crate::
             crate::StructuralEdit::InsertRows { sheet, .. }
             | crate::StructuralEdit::DeleteRows { sheet, .. }
             | crate::StructuralEdit::InsertColumns { sheet, .. }
-            | crate::StructuralEdit::DeleteColumns { sheet, .. } => sheet,
+            | crate::StructuralEdit::DeleteColumns { sheet, .. }
+            | crate::StructuralEdit::InsertCellsRight { sheet, .. }
+            | crate::StructuralEdit::DeleteCellsLeft { sheet, .. }
+            | crate::StructuralEdit::InsertCellsDown { sheet, .. }
+            | crate::StructuralEdit::DeleteCellsUp { sheet, .. } => sheet,
         };
 
         let sheet = base.sheet(sheet_index).ok_or_else(|| IoError::Format(format!("structural edit refers to missing base sheet {sheet_index}")))?;
@@ -612,7 +635,15 @@ fn structurally_shift_package(original: &[u8], base: &Workbook, edits: &[crate::
         let mut text = String::from_utf8(bytes).map_err(|_| IoError::Xml(format!("{part} is not UTF-8 XML")))?;
 
         for edit in sheet_edits {
-            text = shift_sheet_data_coordinates(&text, edit)?;
+            if matches!(
+                edit,
+                crate::StructuralEdit::InsertRows { .. }
+                    | crate::StructuralEdit::DeleteRows { .. }
+                    | crate::StructuralEdit::InsertColumns { .. }
+                    | crate::StructuralEdit::DeleteColumns { .. }
+            ) {
+                text = shift_sheet_data_coordinates(&text, edit)?;
+            }
         }
 
         replacements.insert(normalize(part), text.into_bytes());
@@ -1451,6 +1482,142 @@ mod tests {
 
         let (reopened, _) = read_xlsx(&patched).unwrap();
         assert_eq!(reopened.sheet(0).unwrap().cell(at("A2")).unwrap().value, Value::Number(3.0));
+    }
+
+    #[test]
+    fn structural_insert_cells_right_preserves_package() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c><c r="C1"><v>3</v></c></row><row r="2"><c r="A2"><v>4</v></c><c r="B2"><v>5</v></c></row></sheetData>"#,
+            &[("xl/preserved.xml", "<preserved>leave me alone</preserved>")],
+            "",
+            "",
+        );
+
+        let (base, _) = read_xlsx(&original).unwrap();
+        let mut wb = base.clone();
+
+        wb.sheet_mut(0).unwrap().cells.shift_cols_in_rows(0, 0, 1, 1);
+
+        let patched = patch_xlsx_structural(
+            &original,
+            &base,
+            &wb,
+            &[],
+            &[crate::StructuralEdit::InsertCellsRight { sheet: 0, start_row: 0, end_row: 0, at_col: 1, count: 1 }],
+        )
+        .unwrap();
+
+        assert_only_sheet_changed(&original, &patched);
+        assert_eq!(parts(&original)["xl/preserved.xml"], parts(&patched)["xl/preserved.xml"]);
+
+        let (reopened, _) = read_xlsx(&patched).unwrap();
+        let sh = reopened.sheet(0).unwrap();
+        assert_eq!(sh.value(at("A1")), Value::Number(1.0));
+        assert_eq!(sh.value(at("C1")), Value::Number(2.0));
+        assert_eq!(sh.value(at("D1")), Value::Number(3.0));
+        assert_eq!(sh.value(at("B2")), Value::Number(5.0));
+    }
+
+    #[test]
+    fn structural_delete_cells_left_preserves_package() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c><c r="C1"><v>3</v></c></row><row r="2"><c r="A2"><v>4</v></c><c r="B2"><v>5</v></c></row></sheetData>"#,
+            &[("xl/preserved.xml", "<preserved>leave me alone</preserved>")],
+            "",
+            "",
+        );
+
+        let (base, _) = read_xlsx(&original).unwrap();
+        let mut wb = base.clone();
+
+        wb.sheet_mut(0).unwrap().take_cells(gridcraft_core::RangeRef::new(at("B1"), at("B1")));
+        wb.sheet_mut(0).unwrap().cells.shift_cols_in_rows(0, 0, 2, -1);
+
+        let patched = patch_xlsx_structural(
+            &original,
+            &base,
+            &wb,
+            &[],
+            &[crate::StructuralEdit::DeleteCellsLeft { sheet: 0, start_row: 0, end_row: 0, at_col: 1, count: 1 }],
+        )
+        .unwrap();
+
+        assert_only_sheet_changed(&original, &patched);
+
+        let (reopened, _) = read_xlsx(&patched).unwrap();
+        let sh = reopened.sheet(0).unwrap();
+        assert_eq!(sh.value(at("A1")), Value::Number(1.0));
+        assert_eq!(sh.value(at("B1")), Value::Number(3.0));
+        assert_eq!(sh.value(at("C1")), Value::Empty);
+        assert_eq!(sh.value(at("B2")), Value::Number(5.0));
+    }
+
+    #[test]
+    fn structural_insert_cells_down_preserves_package() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c></row><row r="2"><c r="A2"><v>3</v></c><c r="B2"><v>4</v></c></row><row r="3"><c r="A3"><v>5</v></c><c r="B3"><v>6</v></c></row></sheetData>"#,
+            &[("xl/preserved.xml", "<preserved>leave me alone</preserved>")],
+            "",
+            "",
+        );
+
+        let (base, _) = read_xlsx(&original).unwrap();
+        let mut wb = base.clone();
+
+        wb.sheet_mut(0).unwrap().cells.shift_rows_in_cols(0, 0, 1, 1);
+
+        let patched = patch_xlsx_structural(
+            &original,
+            &base,
+            &wb,
+            &[],
+            &[crate::StructuralEdit::InsertCellsDown { sheet: 0, start_col: 0, end_col: 0, at_row: 1, count: 1 }],
+        )
+        .unwrap();
+
+        assert_only_sheet_changed(&original, &patched);
+
+        let (reopened, _) = read_xlsx(&patched).unwrap();
+        let sh = reopened.sheet(0).unwrap();
+        assert_eq!(sh.value(at("A1")), Value::Number(1.0));
+        assert_eq!(sh.value(at("A2")), Value::Empty);
+        assert_eq!(sh.value(at("A3")), Value::Number(3.0));
+        assert_eq!(sh.value(at("A4")), Value::Number(5.0));
+        assert_eq!(sh.value(at("B2")), Value::Number(4.0));
+    }
+
+    #[test]
+    fn structural_delete_cells_up_preserves_package() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c></row><row r="2"><c r="A2"><v>3</v></c><c r="B2"><v>4</v></c></row><row r="3"><c r="A3"><v>5</v></c><c r="B3"><v>6</v></c></row></sheetData>"#,
+            &[("xl/preserved.xml", "<preserved>leave me alone</preserved>")],
+            "",
+            "",
+        );
+
+        let (base, _) = read_xlsx(&original).unwrap();
+        let mut wb = base.clone();
+
+        wb.sheet_mut(0).unwrap().take_cells(gridcraft_core::RangeRef::new(at("A2"), at("A2")));
+        wb.sheet_mut(0).unwrap().cells.shift_rows_in_cols(0, 0, 2, -1);
+
+        let patched = patch_xlsx_structural(
+            &original,
+            &base,
+            &wb,
+            &[],
+            &[crate::StructuralEdit::DeleteCellsUp { sheet: 0, start_col: 0, end_col: 0, at_row: 1, count: 1 }],
+        )
+        .unwrap();
+
+        assert_only_sheet_changed(&original, &patched);
+
+        let (reopened, _) = read_xlsx(&patched).unwrap();
+        let sh = reopened.sheet(0).unwrap();
+        assert_eq!(sh.value(at("A1")), Value::Number(1.0));
+        assert_eq!(sh.value(at("A2")), Value::Number(5.0));
+        assert_eq!(sh.value(at("A3")), Value::Empty);
+        assert_eq!(sh.value(at("B2")), Value::Number(4.0));
     }
 
     #[test]

@@ -350,6 +350,23 @@ fn insert_cells(s: &mut Session, p: &Json) -> Result<Json> {
         shift_cell_features(sh, &e);
         let name = cx.wb.sheet(sheet).map(|s| s.name.clone()).unwrap_or_default();
         rewrite(&mut cx.wb, &name, &e);
+        cx.xlsx_structural_edits.push(if right {
+            gridcraft_xlsx::StructuralEdit::InsertCellsRight {
+                sheet,
+                start_row: r.start.row,
+                end_row: r.end.row,
+                at_col: r.start.col,
+                count: r.width(),
+            }
+        } else {
+            gridcraft_xlsx::StructuralEdit::InsertCellsDown {
+                sheet,
+                start_col: r.start.col,
+                end_col: r.end.col,
+                at_row: r.start.row,
+                count: r.height(),
+            }
+        });
         cx.structural = true;
         Ok(Json::Null)
     })?;
@@ -382,6 +399,23 @@ fn delete_cells(s: &mut Session, p: &Json) -> Result<Json> {
         }
         // References into the deleted cells become #REF!; the rest move.
         rewrite(&mut cx.wb, &name, &e);
+        cx.xlsx_structural_edits.push(if left {
+            gridcraft_xlsx::StructuralEdit::DeleteCellsLeft {
+                sheet,
+                start_row: r.start.row,
+                end_row: r.end.row,
+                at_col: r.start.col,
+                count: r.width(),
+            }
+        } else {
+            gridcraft_xlsx::StructuralEdit::DeleteCellsUp {
+                sheet,
+                start_col: r.start.col,
+                end_col: r.end.col,
+                at_row: r.start.row,
+                count: r.height(),
+            }
+        });
         cx.structural = true;
         Ok(Json::Null)
     })?;
