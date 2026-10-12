@@ -250,7 +250,7 @@ struct PatchSst {
     map: HashMap<String, u32>,
     next_index: u32,
     new_strings: Vec<String>,
-    count_changed: bool,
+    count_delta: i64,
 }
 
 impl PatchSst {
@@ -269,7 +269,7 @@ impl PatchSst {
             })?;
         }
 
-        Ok(Self { part, map, next_index: index, new_strings: Vec::new(), count_changed: false })
+        Ok(Self { part, map, next_index: index, new_strings: Vec::new(), count_delta: 0 })
     }
 
     fn index(&mut self, text: &str) -> Result<u32, IoError> {
@@ -289,7 +289,7 @@ impl PatchSst {
     }
 
     fn changed(&self) -> bool {
-        self.count_changed || !self.new_strings.is_empty()
+        self.count_delta != 0 || !self.new_strings.is_empty()
     }
 }
 
@@ -521,6 +521,36 @@ fn structural_sheet_is_plain(sheet: &gridcraft_model::Sheet) -> bool {
         && sheet.pivots.is_empty()
 }
 
+fn partial_cell_edit_affects_range(edit: crate::StructuralEdit, range: gridcraft_core::RangeRef) -> bool {
+    match edit {
+        crate::StructuralEdit::InsertCellsRight { start_row, end_row, at_col, .. }
+        | crate::StructuralEdit::DeleteCellsLeft { start_row, end_row, at_col, .. } => {
+            range.start.row <= end_row && range.end.row >= start_row && range.end.col >= at_col
+        }
+        crate::StructuralEdit::InsertCellsDown { start_col, end_col, at_row, .. }
+        | crate::StructuralEdit::DeleteCellsUp { start_col, end_col, at_row, .. } => {
+            range.start.col <= end_col && range.end.col >= start_col && range.end.row >= at_row
+        }
+        _ => false,
+    }
+}
+
+fn partial_cell_sheet_is_plain(sheet: &gridcraft_model::Sheet, edit: crate::StructuralEdit) -> bool {
+    let range_affected = |range| partial_cell_edit_affects_range(edit, range);
+    let cell_affected = |cell| range_affected(gridcraft_core::RangeRef::cell(cell));
+
+    !sheet.merges.iter().any(|&range| range_affected(range))
+        && !sheet.cond_formats.iter().any(|cf| cf.ranges.iter().any(|&range| range_affected(range)))
+        && !sheet.validations.iter().any(|dv| dv.ranges.iter().any(|&range| range_affected(range)))
+        && !sheet.tables.iter().any(|table| range_affected(table.range))
+        && !sheet.autofilter.as_ref().is_some_and(|af| range_affected(af.range))
+        && !sheet.cell_pictures.keys().any(|&cell| cell_affected(cell))
+        && !sheet.comments.keys().any(|&cell| cell_affected(cell))
+        && !sheet.hyperlinks.keys().any(|&cell| cell_affected(cell))
+        && !sheet.sparklines.iter().any(|sp| cell_affected(sp.cell))
+        && !sheet.print.print_area.is_some_and(range_affected)
+}
+
 fn apply_structural_edit_to_baseline(wb: &mut Workbook, edit: crate::StructuralEdit) -> Result<(), IoError> {
     let sheet_index = match edit {
         crate::StructuralEdit::InsertRows { sheet, .. }
@@ -615,9 +645,20 @@ fn structurally_shift_package(original: &[u8], base: &Workbook, edits: &[crate::
 
         let sheet = base.sheet(sheet_index).ok_or_else(|| IoError::Format(format!("structural edit refers to missing base sheet {sheet_index}")))?;
 
-        if !structural_sheet_is_plain(sheet) {
+        let safe = match edit {
+            crate::StructuralEdit::InsertRows { .. }
+            | crate::StructuralEdit::DeleteRows { .. }
+            | crate::StructuralEdit::InsertColumns { .. }
+            | crate::StructuralEdit::DeleteColumns { .. } => structural_sheet_is_plain(sheet),
+            crate::StructuralEdit::InsertCellsRight { .. }
+            | crate::StructuralEdit::DeleteCellsLeft { .. }
+            | crate::StructuralEdit::InsertCellsDown { .. }
+            | crate::StructuralEdit::DeleteCellsUp { .. } => partial_cell_sheet_is_plain(sheet, edit),
+        };
+
+        if !safe {
             return Err(IoError::Format(format!(
-                "safe structural XLSX patching does not yet support row/column edits on sheets with structural features: {}",
+                "safe structural XLSX patching does not yet support this edit on sheets with affected structural features: {}",
                 sheet.name
             )));
         }
@@ -849,7 +890,7 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
                 }
 
                 if new_shared {
-                    sst.count_changed = true;
+                    sst.count_delta += 1;
                 }
 
                 new_cells.push((cell_ref, replacement));
@@ -889,8 +930,10 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
                 replacement = set_cell_style(&replacement, style_index)?;
             }
 
-            if old_shared != new_shared {
-                sst.count_changed = true;
+            match (old_shared, new_shared) {
+                (true, false) => sst.count_delta -= 1,
+                (false, true) => sst.count_delta += 1,
+                _ => {}
             }
 
             edits.push(Edit { start, end, replacement });
@@ -1516,6 +1559,41 @@ mod tests {
         assert_eq!(sh.value(at("C1")), Value::Number(2.0));
         assert_eq!(sh.value(at("D1")), Value::Number(3.0));
         assert_eq!(sh.value(at("B2")), Value::Number(5.0));
+    }
+
+    #[test]
+    fn structural_insert_cells_right_reuses_shared_string_without_rewriting_sst() {
+        let shared_strings = r#"<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="1" uniqueCount="1"><si><t>Owned</t></si></sst>"#;
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1" t="s"><v>0</v></c><c r="C1"><v>2</v></c></row></sheetData>"#,
+            &[("xl/sharedStrings.xml", shared_strings), ("xl/preserved.xml", "<preserved>leave me alone</preserved>")],
+            r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>"#,
+            "",
+        );
+
+        let (base, _) = read_xlsx(&original).unwrap();
+        let mut wb = base.clone();
+
+        wb.sheet_mut(0).unwrap().cells.shift_cols_in_rows(0, 0, 1, 1);
+
+        let patched = patch_xlsx_structural(
+            &original,
+            &base,
+            &wb,
+            &[],
+            &[crate::StructuralEdit::InsertCellsRight { sheet: 0, start_row: 0, end_row: 0, at_col: 1, count: 1 }],
+        )
+        .unwrap();
+
+        assert_only_sheet_changed(&original, &patched);
+        assert_eq!(parts(&original)["xl/sharedStrings.xml"], parts(&patched)["xl/sharedStrings.xml"]);
+
+        let (reopened, _) = read_xlsx(&patched).unwrap();
+        let sh = reopened.sheet(0).unwrap();
+        assert_eq!(sh.value(at("A1")), Value::Number(1.0));
+        assert_eq!(sh.value(at("B1")), Value::Empty);
+        assert_eq!(sh.value(at("C1")), Value::Text("Owned".into()));
+        assert_eq!(sh.value(at("D1")), Value::Number(2.0));
     }
 
     #[test]
