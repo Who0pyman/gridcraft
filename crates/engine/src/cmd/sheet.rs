@@ -646,6 +646,7 @@ fn move_sheet(s: &mut Session, p: &Json) -> Result<Json> {
                     };
                 }
             }
+            cx.xlsx_structural_edits.push(gridcraft_xlsx::StructuralEdit::MoveSheet { from: i, to: at });
         }
         cx.structural = true;
         Ok(Json::Null)

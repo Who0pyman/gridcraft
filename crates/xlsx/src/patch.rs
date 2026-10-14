@@ -333,7 +333,8 @@ fn shifted_cell_ref(cell: CellRef, edit: crate::StructuralEdit) -> Option<CellRe
         | crate::StructuralEdit::DeleteCellsLeft { .. }
         | crate::StructuralEdit::InsertCellsDown { .. }
         | crate::StructuralEdit::DeleteCellsUp { .. }
-        | crate::StructuralEdit::RenameSheet { .. } => Some(cell),
+        | crate::StructuralEdit::RenameSheet { .. }
+        | crate::StructuralEdit::MoveSheet { .. } => Some(cell),
     }
 }
 
@@ -553,6 +554,30 @@ fn partial_cell_sheet_is_plain(sheet: &gridcraft_model::Sheet, edit: crate::Stru
 }
 
 fn apply_structural_edit_to_baseline(wb: &mut Workbook, edit: crate::StructuralEdit) -> Result<(), IoError> {
+    if let crate::StructuralEdit::MoveSheet { from, to } = edit {
+        if from >= wb.sheets.len() {
+            return Err(IoError::Format(format!("sheet move refers to missing source sheet {from}")));
+        }
+
+        let sheet = wb.sheets.remove(from);
+        let at = to.min(wb.sheets.len());
+        wb.sheets.insert(at, sheet);
+        wb.active_sheet = at;
+
+        for name in &mut wb.names {
+            if let Some(scope) = name.scope.as_mut() {
+                *scope = match *scope {
+                    x if x == from => at,
+                    x if from < x && x <= at => x - 1,
+                    x if at <= x && x < from => x + 1,
+                    x => x,
+                };
+            }
+        }
+
+        return Ok(());
+    }
+
     let sheet_index = match edit {
         crate::StructuralEdit::InsertRows { sheet, .. }
         | crate::StructuralEdit::DeleteRows { sheet, .. }
@@ -563,6 +588,9 @@ fn apply_structural_edit_to_baseline(wb: &mut Workbook, edit: crate::StructuralE
         | crate::StructuralEdit::InsertCellsDown { sheet, .. }
         | crate::StructuralEdit::DeleteCellsUp { sheet, .. }
         | crate::StructuralEdit::RenameSheet { sheet } => sheet,
+        crate::StructuralEdit::MoveSheet { .. } => {
+            return Err(IoError::Format("sheet move should have been handled before cell edits".into()));
+        }
     };
 
     let sheet = wb.sheet_mut(sheet_index).ok_or_else(|| IoError::Format(format!("structural edit refers to missing sheet {sheet_index}")))?;
@@ -600,6 +628,9 @@ fn apply_structural_edit_to_baseline(wb: &mut Workbook, edit: crate::StructuralE
         | crate::StructuralEdit::InsertCellsDown { .. }
         | crate::StructuralEdit::DeleteCellsUp { .. }
         | crate::StructuralEdit::RenameSheet { .. } => {}
+        crate::StructuralEdit::MoveSheet { .. } => {
+            return Err(IoError::Format("sheet move should have been handled before cell edits".into()));
+        }
     }
 
     Ok(())
@@ -645,6 +676,7 @@ fn structurally_shift_package(original: &[u8], base: &Workbook, edits: &[crate::
             | crate::StructuralEdit::InsertCellsDown { sheet, .. }
             | crate::StructuralEdit::DeleteCellsUp { sheet, .. }
             | crate::StructuralEdit::RenameSheet { sheet } => sheet,
+            crate::StructuralEdit::MoveSheet { .. } => continue,
         };
 
         let sheet = base.sheet(sheet_index).ok_or_else(|| IoError::Format(format!("structural edit refers to missing base sheet {sheet_index}")))?;
@@ -659,6 +691,7 @@ fn structurally_shift_package(original: &[u8], base: &Workbook, edits: &[crate::
             | crate::StructuralEdit::InsertCellsDown { .. }
             | crate::StructuralEdit::DeleteCellsUp { .. } => partial_cell_sheet_is_plain(sheet, edit),
             crate::StructuralEdit::RenameSheet { .. } => true,
+            crate::StructuralEdit::MoveSheet { .. } => true,
         };
 
         if !safe {
@@ -754,6 +787,208 @@ fn rename_formula_for_sheets(text: &str, renames: &[(String, String)]) -> String
     }
 
     if changed { gridcraft_formula::print(&expr) } else { text.to_string() }
+}
+
+fn patch_workbook_sheet_moves(original: &[u8], base: &Workbook, wb: &Workbook, edits: &[crate::StructuralEdit]) -> Result<Vec<u8>, IoError> {
+    let moves: Vec<(usize, usize)> = edits
+        .iter()
+        .filter_map(|edit| match *edit {
+            crate::StructuralEdit::MoveSheet { from, to } => Some((from, to)),
+            _ => None,
+        })
+        .collect();
+
+    if moves.is_empty() {
+        return Ok(original.to_vec());
+    }
+
+    let mut pkg = Package::open(original)?;
+    let root_rels = pkg.rels("")?;
+    let wb_part = root_rels.iter().find(|r| r.kind == "officeDocument").map(|r| r.target.clone()).unwrap_or_else(|| "xl/workbook.xml".into());
+    let wb_rels = pkg.rels(&wb_part)?;
+    let wb_bytes = pkg.read(&wb_part)?.ok_or_else(|| IoError::Format("missing workbook part".into()))?;
+    let wb_tree = xml::parse(&wb_bytes)?;
+    let mut text = String::from_utf8(wb_bytes).map_err(|_| IoError::Xml(format!("{wb_part} is not UTF-8 XML")))?;
+
+    struct TextEdit {
+        start: usize,
+        end: usize,
+        replacement: String,
+    }
+
+    let parsed_sheets: Vec<_> = wb_tree.child("sheets").map(|s| s.kids("sheet").collect()).unwrap_or_default();
+    let mut raw_sheet_spans = Vec::new();
+    let mut pos = 0usize;
+    while let Some(rel) = text[pos..].find("<sheet") {
+        let start = pos + rel;
+        let next = text.as_bytes().get(start + "<sheet".len()).copied();
+        if !matches!(next, Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') | Some(b'>') | Some(b'/')) {
+            pos = start + "<sheet".len();
+            continue;
+        }
+        let end_rel = text[start..].find('>').ok_or_else(|| IoError::Xml("unterminated <sheet> tag in workbook.xml".into()))?;
+        let end = start + end_rel + 1;
+        raw_sheet_spans.push((start, end));
+        pos = end;
+    }
+
+    if raw_sheet_spans.len() != parsed_sheets.len() {
+        return Err(IoError::Format("safe sheet move could not align workbook sheet tags".into()));
+    }
+
+    let mut worksheet_slots = Vec::new();
+    let mut worksheet_tags = Vec::new();
+
+    for (raw_index, ((start, end), sheet_el)) in raw_sheet_spans.iter().copied().zip(parsed_sheets.iter().copied()).enumerate() {
+        let is_worksheet = sheet_el.attr("id").and_then(|id| wb_rels.iter().find(|r| r.id == id)).is_some_and(|r| r.kind == "worksheet");
+        if is_worksheet {
+            worksheet_slots.push(raw_index);
+            worksheet_tags.push(text[start..end].to_string());
+        }
+    }
+
+    if worksheet_tags.len() != base.sheets.len() || worksheet_tags.len() != wb.sheets.len() {
+        return Err(IoError::Format("safe sheet move could not align workbook worksheets with the model".into()));
+    }
+
+    let mut order: Vec<usize> = (0..worksheet_tags.len()).collect();
+    for &(from, to) in &moves {
+        if from >= order.len() {
+            return Err(IoError::Format(format!("sheet move refers to missing source sheet {from}")));
+        }
+        let item = order.remove(from);
+        let at = to.min(order.len());
+        order.insert(at, item);
+    }
+
+    let mut text_edits = Vec::new();
+
+    // Keep chart-sheet slots exactly where they were, but reorder the worksheet
+    // tags across the worksheet slots to match the model order.
+    for (model_index, &raw_index) in worksheet_slots.iter().enumerate() {
+        let (start, end) = raw_sheet_spans[raw_index];
+        text_edits.push(TextEdit { start, end, replacement: worksheet_tags[order[model_index]].clone() });
+    }
+
+    // Map each original raw sheet index to the raw index occupied by that same
+    // worksheet after the move. Chart sheets remain fixed in place.
+    let mut raw_index_map = BTreeMap::new();
+    for (new_model_index, &old_model_index) in order.iter().enumerate() {
+        raw_index_map.insert(worksheet_slots[old_model_index], worksheet_slots[new_model_index]);
+    }
+
+    // The engine activates the moved worksheet. activeTab is a raw workbook
+    // sheet index, not a model worksheet index.
+    if wb.active_sheet < worksheet_slots.len()
+        && let Some(rel) = text.find("<workbookView")
+    {
+        let start = rel;
+        let next = text.as_bytes().get(start + "<workbookView".len()).copied();
+        if matches!(next, Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') | Some(b'>') | Some(b'/')) {
+            let end_rel = text[start..].find('>').ok_or_else(|| IoError::Xml("unterminated <workbookView> tag".into()))?;
+            let end = start + end_rel + 1;
+            let replacement = set_tag_attr(&text[start..end], "activeTab", &worksheet_slots[wb.active_sheet].to_string())?;
+            text_edits.push(TextEdit { start, end, replacement });
+        }
+    }
+
+    // Sheet-scoped defined names use raw sheet indices. Make the scope follow
+    // the same worksheet identity after the reorder.
+    let parsed_names: Vec<_> = wb_tree.child("definedNames").map(|d| d.kids("definedName").collect()).unwrap_or_default();
+    if !parsed_names.is_empty() {
+        let mut raw_name_tags = Vec::new();
+        let mut pos = 0usize;
+        while let Some(rel) = text[pos..].find("<definedName") {
+            let start = pos + rel;
+            let next = text.as_bytes().get(start + "<definedName".len()).copied();
+            if !matches!(next, Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') | Some(b'>') | Some(b'/')) {
+                pos = start + "<definedName".len();
+                continue;
+            }
+            let end_rel = text[start..].find('>').ok_or_else(|| IoError::Xml("unterminated <definedName> tag".into()))?;
+            let end = start + end_rel + 1;
+            raw_name_tags.push((start, end));
+            pos = end;
+        }
+
+        if raw_name_tags.len() != parsed_names.len() {
+            return Err(IoError::Format("safe sheet move could not align workbook defined names".into()));
+        }
+
+        for ((start, end), parsed) in raw_name_tags.into_iter().zip(parsed_names) {
+            let Some(old_raw) = parsed.attr_u32("localSheetId").map(|v| v as usize) else {
+                continue;
+            };
+            let Some(&new_raw) = raw_index_map.get(&old_raw) else {
+                continue;
+            };
+            if new_raw != old_raw {
+                let replacement = set_tag_attr(&text[start..end], "localSheetId", &new_raw.to_string())?;
+                text_edits.push(TextEdit { start, end, replacement });
+            }
+        }
+    }
+
+    // Custom workbook views also store a raw sheet index. Preserve the sheet
+    // each custom view points at when possible.
+    let parsed_custom_views: Vec<_> = wb_tree.child("customWorkbookViews").map(|v| v.kids("customWorkbookView").collect()).unwrap_or_default();
+    if !parsed_custom_views.is_empty() {
+        let mut raw_custom_tags = Vec::new();
+        let mut pos = 0usize;
+        while let Some(rel) = text[pos..].find("<customWorkbookView") {
+            let start = pos + rel;
+            let next = text.as_bytes().get(start + "<customWorkbookView".len()).copied();
+            if !matches!(next, Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') | Some(b'>') | Some(b'/')) {
+                pos = start + "<customWorkbookView".len();
+                continue;
+            }
+            let end_rel = text[start..].find('>').ok_or_else(|| IoError::Xml("unterminated <customWorkbookView> tag".into()))?;
+            let end = start + end_rel + 1;
+            raw_custom_tags.push((start, end));
+            pos = end;
+        }
+
+        if raw_custom_tags.len() != parsed_custom_views.len() {
+            return Err(IoError::Format("safe sheet move could not align custom workbook views".into()));
+        }
+
+        for ((start, end), parsed) in raw_custom_tags.into_iter().zip(parsed_custom_views) {
+            let Some(old_raw) = parsed.attr_u32("activeSheetId").map(|v| v as usize) else {
+                continue;
+            };
+            let Some(&new_raw) = raw_index_map.get(&old_raw) else {
+                continue;
+            };
+            if new_raw != old_raw {
+                let replacement = set_tag_attr(&text[start..end], "activeSheetId", &new_raw.to_string())?;
+                text_edits.push(TextEdit { start, end, replacement });
+            }
+        }
+    }
+
+    text_edits.sort_by_key(|e| e.start);
+    for edit in text_edits.into_iter().rev() {
+        text.replace_range(edit.start..edit.end, &edit.replacement);
+    }
+
+    let mut archive = zip::ZipArchive::new(Cursor::new(original)).map_err(|e| IoError::Zip(e.to_string()))?;
+    let mut out = ZipOut::new();
+    let normalized_wb_part = normalize(&wb_part);
+
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i).map_err(|e| IoError::Zip(e.to_string()))?;
+        let name = file.name().to_string();
+        let mut bytes = Vec::with_capacity(file.size() as usize);
+        file.read_to_end(&mut bytes).map_err(|e| IoError::Zip(e.to_string()))?;
+
+        if normalize(&name) == normalized_wb_part {
+            out.add(&name, text.as_bytes())?;
+        } else {
+            out.add(&name, &bytes)?;
+        }
+    }
+
+    out.finish()
 }
 
 fn patch_workbook_sheet_renames(original: &[u8], base: &Workbook, wb: &Workbook, edits: &[crate::StructuralEdit]) -> Result<Vec<u8>, IoError> {
@@ -920,6 +1155,76 @@ pub fn patch_xlsx_structural(
 
     if base.sheets.len() != wb.sheets.len() {
         return Err(IoError::Format("safe structural XLSX patching requires the worksheet set to remain unchanged".into()));
+    }
+
+    let has_move = edits.iter().any(|edit| matches!(edit, crate::StructuralEdit::MoveSheet { .. }));
+    if has_move {
+        if edits.iter().any(|edit| !matches!(edit, crate::StructuralEdit::MoveSheet { .. })) {
+            return Err(IoError::Format("safe sheet move does not yet support combining sheet moves with other structural edits".into()));
+        }
+
+        let mut order: Vec<usize> = (0..base.sheets.len()).collect();
+        let mut expected_names = base.names.clone();
+
+        for &edit in edits {
+            let crate::StructuralEdit::MoveSheet { from, to } = edit else {
+                continue;
+            };
+
+            if from >= order.len() {
+                return Err(IoError::Format(format!("sheet move refers to missing source sheet {from}")));
+            }
+
+            let item = order.remove(from);
+            let at = to.min(order.len());
+            order.insert(at, item);
+
+            for name in &mut expected_names {
+                if let Some(scope) = name.scope.as_mut() {
+                    *scope = match *scope {
+                        x if x == from => at,
+                        x if from < x && x <= at => x - 1,
+                        x if at <= x && x < from => x + 1,
+                        x => x,
+                    };
+                }
+            }
+        }
+
+        for (final_index, &original_index) in order.iter().enumerate() {
+            let before = base.sheet(original_index).ok_or_else(|| IoError::Format(format!("missing base sheet {original_index}")))?;
+            let after = wb.sheet(final_index).ok_or_else(|| IoError::Format(format!("missing final sheet {final_index}")))?;
+            if before.name != after.name {
+                return Err(IoError::Format("safe sheet move found a worksheet rename or unexpected sheet order".into()));
+            }
+        }
+
+        if expected_names != wb.names {
+            return Err(IoError::Format("safe sheet move found defined-name changes other than scope remapping".into()));
+        }
+
+        let structurally_shifted = patch_workbook_sheet_moves(original, base, wb, edits)?;
+
+        let mut shifted_base = base.clone();
+        for &edit in edits {
+            apply_structural_edit_to_baseline(&mut shifted_base, edit)?;
+        }
+
+        // Derive dirty cells from the reordered baseline instead of trusting
+        // pre-move sheet indices recorded before the structural edit.
+        let mut dirty: BTreeMap<usize, BTreeSet<CellRef>> = BTreeMap::new();
+        for sheet_index in 0..shifted_base.sheets.len() {
+            let before = shifted_base.sheet(sheet_index).ok_or_else(|| IoError::Format(format!("missing shifted base sheet {sheet_index}")))?;
+            let after = wb.sheet(sheet_index).ok_or_else(|| IoError::Format(format!("missing final sheet {sheet_index}")))?;
+            for cell_ref in before.cells.diff(&after.cells) {
+                dirty.entry(sheet_index).or_default().insert(cell_ref);
+            }
+        }
+
+        let dirty: Vec<(usize, CellRef)> =
+            dirty.into_iter().flat_map(|(sheet, refs)| refs.into_iter().map(move |cell_ref| (sheet, cell_ref))).collect();
+
+        return if dirty.is_empty() { Ok(structurally_shifted) } else { patch_xlsx(&structurally_shifted, &shifted_base, wb, &dirty) };
     }
 
     let rename_indices: BTreeSet<usize> = edits
@@ -1713,6 +2018,85 @@ mod tests {
         assert_eq!(reopened.sheet(1).unwrap().cell(at("A1")).unwrap().formula.as_ref().unwrap().text, "Minerals!A1+1");
         assert_eq!(reopened.names.iter().find(|n| n.name == "Owned").unwrap().formula, "Minerals!$A$1");
         assert_eq!(reopened.sheet(0).unwrap().print.print_area.unwrap().a1(), "A1:B2");
+    }
+
+    #[test]
+    fn structural_move_sheet_preserves_package_and_raw_sheet_indices() {
+        let wb_xml = r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><bookViews><workbookView activeTab="0"/></bookViews><sheets><sheet name="Data" sheetId="1" r:id="rId1"/><sheet name="Chart" sheetId="2" r:id="rIdChart"/><sheet name="Calc" sheetId="3" r:id="rId2"/></sheets><definedNames><definedName name="DataLocal" localSheetId="0">Data!$A$1</definedName><definedName name="CalcLocal" localSheetId="2">Calc!$A$1</definedName><definedName name="_xlnm.Print_Area" localSheetId="0">Data!$A$1:$B$2</definedName></definedNames><customWorkbookViews><customWorkbookView name="Data View" guid="{00000000-0000-0000-0000-000000000001}" activeSheetId="0"/></customWorkbookViews><calcPr/></workbook>"#;
+        let wb_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rIdChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet" Target="chartsheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>"#;
+        let sheet1 = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>10</v></c></row></sheetData></worksheet>"#;
+        let sheet2 = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>20</v></c></row></sheetData></worksheet>"#;
+        let chart_sheet = r#"<chartsheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>"#;
+
+        let original = crate::tests::make_zip(&[
+            ("[Content_Types].xml", crate::tests::CT.as_bytes()),
+            ("_rels/.rels", crate::tests::ROOT_RELS.as_bytes()),
+            ("xl/workbook.xml", wb_xml.as_bytes()),
+            ("xl/_rels/workbook.xml.rels", wb_rels.as_bytes()),
+            ("xl/worksheets/sheet1.xml", sheet1.as_bytes()),
+            ("xl/worksheets/sheet2.xml", sheet2.as_bytes()),
+            ("xl/chartsheets/sheet1.xml", chart_sheet.as_bytes()),
+            ("xl/preserved.xml", b"<preserved>leave me alone</preserved>"),
+        ]);
+
+        let (base, _) = read_xlsx(&original).unwrap();
+        assert_eq!(base.sheets.len(), 2);
+        assert_eq!(base.sheet(0).unwrap().name, "Data");
+        assert_eq!(base.sheet(1).unwrap().name, "Calc");
+
+        let mut wb = base.clone();
+
+        let moved = wb.sheets.remove(0);
+        wb.sheets.insert(1, moved);
+        wb.active_sheet = 1;
+
+        for name in &mut wb.names {
+            if let Some(scope) = name.scope.as_mut() {
+                *scope = match *scope {
+                    0 => 1,
+                    1 => 0,
+                    x => x,
+                };
+            }
+        }
+
+        let patched = patch_xlsx_structural(&original, &base, &wb, &[], &[crate::StructuralEdit::MoveSheet { from: 0, to: 1 }]).unwrap();
+
+        let before = parts(&original);
+        let after = parts(&patched);
+        let changed: Vec<_> = before.iter().filter_map(|(name, data)| (after.get(name) != Some(data)).then_some(name.as_str())).collect();
+
+        assert_eq!(changed, vec!["xl/workbook.xml"]);
+        assert_eq!(before["xl/worksheets/sheet1.xml"], after["xl/worksheets/sheet1.xml"]);
+        assert_eq!(before["xl/worksheets/sheet2.xml"], after["xl/worksheets/sheet2.xml"]);
+        assert_eq!(before["xl/chartsheets/sheet1.xml"], after["xl/chartsheets/sheet1.xml"]);
+        assert_eq!(before["xl/preserved.xml"], after["xl/preserved.xml"]);
+
+        let workbook = String::from_utf8(after["xl/workbook.xml"].clone()).unwrap();
+
+        let calc_pos = workbook.find(r#"name="Calc""#).unwrap();
+        let chart_pos = workbook.find(r#"name="Chart""#).unwrap();
+        let data_pos = workbook.find(r#"name="Data""#).unwrap();
+        assert!(calc_pos < chart_pos && chart_pos < data_pos);
+
+        assert!(workbook.contains(r#"activeTab="2""#));
+        assert!(workbook.contains(r#"name="DataLocal" localSheetId="2""#));
+        assert!(workbook.contains(r#"name="CalcLocal" localSheetId="0""#));
+        assert!(workbook.contains(r#"name="_xlnm.Print_Area" localSheetId="2""#));
+        assert!(workbook.contains(r#"activeSheetId="2""#));
+
+        let (reopened, _) = read_xlsx(&patched).unwrap();
+        assert_eq!(reopened.sheet(0).unwrap().name, "Calc");
+        assert_eq!(reopened.sheet(1).unwrap().name, "Data");
+        assert_eq!(reopened.active_sheet, 1);
+        assert_eq!(reopened.sheet(0).unwrap().cell(at("A1")).unwrap().value, Value::Number(20.0));
+        assert_eq!(reopened.sheet(1).unwrap().cell(at("A1")).unwrap().value, Value::Number(10.0));
+        assert_eq!(reopened.sheet(1).unwrap().print.print_area.unwrap().a1(), "A1:B2");
+
+        let data_local = reopened.names.iter().find(|n| n.name == "DataLocal").unwrap();
+        let calc_local = reopened.names.iter().find(|n| n.name == "CalcLocal").unwrap();
+        assert_eq!(data_local.scope, Some(1));
+        assert_eq!(calc_local.scope, Some(0));
     }
 
     #[test]
