@@ -887,7 +887,18 @@ fn patch_workbook_sheet_moves(original: &[u8], base: &Workbook, wb: &Workbook, e
         if matches!(next, Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') | Some(b'>') | Some(b'/')) {
             let end_rel = text[start..].find('>').ok_or_else(|| IoError::Xml("unterminated <workbookView> tag".into()))?;
             let end = start + end_rel + 1;
-            let replacement = set_tag_attr(&text[start..end], "activeTab", &worksheet_slots[wb.active_sheet].to_string())?;
+            let mut replacement = text[start..end].to_string();
+
+            // firstSheet is also a raw workbook sheet index. If present,
+            // keep the leftmost visible tab attached to the same sheet.
+            if let Some(old_raw) = attr_value(&replacement, "firstSheet").and_then(|value| value.parse::<usize>().ok())
+                && let Some(&new_raw) = raw_index_map.get(&old_raw)
+                && new_raw != old_raw
+            {
+                replacement = set_tag_attr(&replacement, "firstSheet", &new_raw.to_string())?;
+            }
+
+            replacement = set_tag_attr(&replacement, "activeTab", &worksheet_slots[wb.active_sheet].to_string())?;
             text_edits.push(TextEdit { start, end, replacement });
         }
     }
@@ -2022,7 +2033,7 @@ mod tests {
 
     #[test]
     fn structural_move_sheet_preserves_package_and_raw_sheet_indices() {
-        let wb_xml = r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><bookViews><workbookView activeTab="0"/></bookViews><sheets><sheet name="Data" sheetId="1" r:id="rId1"/><sheet name="Chart" sheetId="2" r:id="rIdChart"/><sheet name="Calc" sheetId="3" r:id="rId2"/></sheets><definedNames><definedName name="DataLocal" localSheetId="0">Data!$A$1</definedName><definedName name="CalcLocal" localSheetId="2">Calc!$A$1</definedName><definedName name="_xlnm.Print_Area" localSheetId="0">Data!$A$1:$B$2</definedName></definedNames><customWorkbookViews><customWorkbookView name="Data View" guid="{00000000-0000-0000-0000-000000000001}" activeSheetId="0"/></customWorkbookViews><calcPr/></workbook>"#;
+        let wb_xml = r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><bookViews><workbookView activeTab="0" firstSheet="0"/></bookViews><sheets><sheet name="Data" sheetId="1" r:id="rId1"/><sheet name="Chart" sheetId="2" r:id="rIdChart"/><sheet name="Calc" sheetId="3" r:id="rId2"/></sheets><definedNames><definedName name="DataLocal" localSheetId="0">Data!$A$1</definedName><definedName name="CalcLocal" localSheetId="2">Calc!$A$1</definedName><definedName name="_xlnm.Print_Area" localSheetId="0">Data!$A$1:$B$2</definedName></definedNames><customWorkbookViews><customWorkbookView name="Data View" guid="{00000000-0000-0000-0000-000000000001}" activeSheetId="0"/></customWorkbookViews><calcPr/></workbook>"#;
         let wb_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rIdChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet" Target="chartsheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>"#;
         let sheet1 = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>10</v></c></row></sheetData></worksheet>"#;
         let sheet2 = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>20</v></c></row></sheetData></worksheet>"#;
@@ -2080,6 +2091,7 @@ mod tests {
         assert!(calc_pos < chart_pos && chart_pos < data_pos);
 
         assert!(workbook.contains(r#"activeTab="2""#));
+        assert!(workbook.contains(r#"firstSheet="2""#));
         assert!(workbook.contains(r#"name="DataLocal" localSheetId="2""#));
         assert!(workbook.contains(r#"name="CalcLocal" localSheetId="0""#));
         assert!(workbook.contains(r#"name="_xlnm.Print_Area" localSheetId="2""#));
