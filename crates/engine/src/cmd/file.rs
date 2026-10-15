@@ -84,6 +84,36 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
     )
 }
 
+/// Produce XLSX bytes without silently falling back to the full writer for a workbook that
+/// originated as XLSX. The full writer cannot preserve package parts ORGrid does not model, so
+/// an unsupported structural edit must fail visibly rather than discard Excel content.
+fn safe_xlsx_bytes(d: &DocState, path: &str) -> Result<Vec<u8>> {
+    match &d.original_xlsx {
+        Some(original) if !d.is_dirty() => Ok(original.clone()),
+        Some(original) if !d.xlsx_structural_dirty && d.xlsx_structural_edits.is_empty() => {
+            gridcraft_xlsx::patch_xlsx(original, &d.saved, &d.wb, &d.xlsx_dirty_cells)
+                .map_err(|e| EngineError::Other(format!("Safe XLSX patch save failed: {e}")))
+        }
+        Some(original) if !d.xlsx_structural_dirty => gridcraft_xlsx::patch_xlsx_structural(
+            original,
+            &d.saved,
+            &d.wb,
+            &d.xlsx_dirty_cells,
+            &d.xlsx_structural_edits,
+        )
+        .map_err(|e| {
+            EngineError::Other(format!(
+                "Safe XLSX structural patch save failed: {e}. The workbook was not rewritten because doing so could discard unsupported Excel content."
+            ))
+        }),
+        Some(_) => Err(EngineError::Other(
+            "This workbook contains a structural edit ORGrid cannot yet save without rewriting the Excel package. The workbook was not saved because a rewrite could discard unsupported Excel content. Undo that structural edit and try again."
+                .into(),
+        )),
+        None => crate::io::save_bytes(&d.wb, path),
+    }
+}
+
 fn save(s: &mut Session, p: &Json) -> Result<Json> {
     let path = match str_param(p, "path").map(str::to_string).or_else(|| s.active().and_then(|d| d.path.clone())) {
         Some(p) => p,
@@ -96,20 +126,7 @@ fn save(s: &mut Session, p: &Json) -> Result<Json> {
     let kind = crate::io::FileKind::from_path(&path).unwrap_or(crate::io::FileKind::Xlsx);
 
     let bytes = if matches!(kind, crate::io::FileKind::Xlsx) {
-        match &d.original_xlsx {
-            Some(original) if !d.is_dirty() => original.clone(),
-            Some(original) if !d.xlsx_structural_dirty && d.xlsx_structural_edits.is_empty() => {
-                gridcraft_xlsx::patch_xlsx(original, &d.saved, &d.wb, &d.xlsx_dirty_cells)
-                    .map_err(|e| EngineError::Other(format!("Safe XLSX patch save failed: {e}")))?
-            }
-            Some(original) if !d.xlsx_structural_dirty => {
-                match gridcraft_xlsx::patch_xlsx_structural(original, &d.saved, &d.wb, &d.xlsx_dirty_cells, &d.xlsx_structural_edits) {
-                    Ok(bytes) => bytes,
-                    Err(_) => crate::io::save_bytes(&d.wb, &path)?,
-                }
-            }
-            _ => crate::io::save_bytes(&d.wb, &path)?,
-        }
+        safe_xlsx_bytes(d, &path)?
     } else {
         crate::io::save_bytes(&d.wb, &path)?
     };
@@ -148,7 +165,8 @@ fn save_as(s: &mut Session, p: &Json) -> Result<Json> {
 fn save_bytes(s: &mut Session, p: &Json) -> Result<Json> {
     let fmt = str_param(p, "format").unwrap_or("xlsx");
     let d = s.doc()?;
-    let bytes = crate::io::save_bytes(&d.wb, &format!("x.{fmt}"))?;
+    let virtual_path = format!("x.{fmt}");
+    let bytes = if fmt == "xlsx" { safe_xlsx_bytes(d, &virtual_path)? } else { crate::io::save_bytes(&d.wb, &virtual_path)? };
     let name = format!("{}.{fmt}", std::path::Path::new(&d.display_title()).file_stem().and_then(|x| x.to_str()).unwrap_or("Book"));
     Ok(json!({"name": name, "base64": crate::io::base64_encode(&bytes), "bytes": bytes.len()}))
 }
@@ -204,4 +222,38 @@ fn activate_window(s: &mut Session, p: &Json) -> Result<Json> {
     }
     s.set_active(i);
     ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refuses_unsafe_full_rewrite_of_loaded_xlsx() {
+        let mut session = Session::new();
+        session.new_workbook();
+        session.execute("cell.set", json!({"cell": "A1", "input": "changed"})).unwrap();
+        let d = session.doc_mut().unwrap();
+        d.original_xlsx = Some(vec![1, 2, 3]);
+        d.xlsx_structural_dirty = true;
+
+        let err = safe_xlsx_bytes(d, "x.xlsx").unwrap_err().to_string();
+        assert!(err.contains("was not saved"));
+        assert!(err.contains("unsupported Excel content"));
+    }
+
+    #[test]
+    fn save_bytes_uses_safe_xlsx_path_for_loaded_workbooks() {
+        let mut session = Session::new();
+        session.new_workbook();
+        session.execute("cell.set", json!({"cell": "A1", "input": "changed"})).unwrap();
+        {
+            let d = session.doc_mut().unwrap();
+            d.original_xlsx = Some(vec![1, 2, 3]);
+            d.xlsx_structural_dirty = true;
+        }
+
+        let err = session.execute("file.saveBytes", json!({"format": "xlsx"})).unwrap_err().to_string();
+        assert!(err.contains("was not saved"));
+    }
 }
