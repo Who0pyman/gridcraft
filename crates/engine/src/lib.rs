@@ -63,6 +63,8 @@ pub struct HistoryEntry {
     pub xlsx_structural_dirty: bool,
     /// Excel package snapshot generation. Saves create a new baseline for undo.
     pub xlsx_epoch: u64,
+    /// The command represented by this history entry changed workbook structure.
+    pub structural_action: bool,
 }
 
 /// The clipboard: a block of cells (with formulas and styles) or marching-ants reference.
@@ -351,6 +353,8 @@ impl Session {
             && let Some(d) = self.docs.iter_mut().find(|d| d.uid == uid)
             && !Arc::ptr_eq(&d.wb, &wb)
         {
+            let structural_action = d.xlsx_structural_dirty != structural_dirty
+                || d.xlsx_structural_edits.len() != structural_edits.len();
             d.undo.push(HistoryEntry {
                 label: spec.label.trim_end_matches('…').to_string(),
                 wb,
@@ -360,6 +364,7 @@ impl Session {
                 xlsx_structural_edits: structural_edits,
                 xlsx_structural_dirty: structural_dirty,
                 xlsx_epoch: epoch,
+                structural_action,
             });
             if d.undo.len() > UNDO_LIMIT {
                 d.undo.remove(0);
