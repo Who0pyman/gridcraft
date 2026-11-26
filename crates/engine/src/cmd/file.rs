@@ -105,6 +105,63 @@ fn xlsx_preservation_error(reason: &str) -> EngineError {
     ))
 }
 
+/// Package patching writes cell content and styles, not every workbook feature.
+/// If the in-memory model has other edits, returning success would silently lose
+/// those edits while claiming the file was saved. Fail rather than discard them.
+fn unsupported_cell_patch_change(before: &gridcraft_model::Workbook, after: &gridcraft_model::Workbook) -> Option<String> {
+    if before.sheets.len() != after.sheets.len() {
+        return Some("worksheet count changed".into());
+    }
+    if before.names != after.names {
+        return Some("defined names changed".into());
+    }
+    if before.theme != after.theme || before.date_system != after.date_system || before.calc != after.calc {
+        return Some("workbook theme or calculation settings changed".into());
+    }
+    if before.props != after.props
+        || before.protected_structure != after.protected_structure
+        || before.custom_lists != after.custom_lists
+        || before.cell_styles != after.cell_styles
+    {
+        return Some("workbook properties or named styles changed".into());
+    }
+    for (previous, current) in before.sheets.iter().zip(&after.sheets) {
+        if previous.name != current.name
+            || previous.rows != current.rows
+            || previous.cols != current.cols
+            || previous.default_col_width != current.default_col_width
+            || previous.default_row_height != current.default_row_height
+            || previous.merges != current.merges
+            || previous.freeze != current.freeze
+            || previous.tab_color != current.tab_color
+            || previous.visibility != current.visibility
+            || previous.show_gridlines != current.show_gridlines
+            || previous.show_headings != current.show_headings
+            || previous.show_formulas != current.show_formulas
+            || previous.show_zeros != current.show_zeros
+            || previous.right_to_left != current.right_to_left
+            || previous.zoom != current.zoom
+            || previous.cond_formats != current.cond_formats
+            || previous.validations != current.validations
+            || previous.tables != current.tables
+            || previous.autofilter != current.autofilter
+            || previous.cell_pictures != current.cell_pictures
+            || previous.comments != current.comments
+            || previous.hyperlinks != current.hyperlinks
+            || previous.charts != current.charts
+            || previous.images != current.images
+            || previous.shapes != current.shapes
+            || previous.sparklines != current.sparklines
+            || previous.pivots != current.pivots
+            || previous.protection != current.protection
+            || previous.print != current.print
+        {
+            return Some(format!("unpatchable worksheet features changed on {}", previous.name));
+        }
+    }
+    None
+}
+
 fn save(s: &mut Session, p: &Json) -> Result<Json> {
     let path = match str_param(p, "path").map(str::to_string).or_else(|| s.active().and_then(|d| d.path.clone())) {
         Some(p) => p,
@@ -135,6 +192,11 @@ fn save(s: &mut Session, p: &Json) -> Result<Json> {
         match &d.original_xlsx {
             Some(original) if !d.is_dirty() => original.clone(),
             Some(original) if !d.xlsx_structural_dirty && d.xlsx_structural_edits.is_empty() => {
+                if let Some(change) = unsupported_cell_patch_change(&d.saved, &d.wb) {
+                    return Err(xlsx_preservation_error(&format!(
+                        "This edit cannot be represented by a cell-only package patch ({change})."
+                    )));
+                }
                 gridcraft_xlsx::patch_xlsx(original, &d.saved, &d.wb, &d.xlsx_dirty_cells)
                     .map_err(|e| EngineError::Other(format!("Safe XLSX patch save failed: {e}")))?
             }
