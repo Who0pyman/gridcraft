@@ -567,6 +567,31 @@ fn coalesce(cells: &[CellRef]) -> Vec<RangeRef> {
 
 // ---------------------------------------------------------------- history
 
+/// Undo entries may have been recorded against an older OOXML package,
+/// before the user saved the workbook. Rebuild the dirty-cell list against the
+/// *current* saved package rather than replaying stale cell/row coordinates.
+/// Structural edits across a save boundary are intentionally blocked until a
+/// full package-preserving structural rebase can be implemented.
+fn rebase_excel_undo_tracking(d: &mut crate::DocState, structural_action: bool) {
+    d.xlsx_dirty_cells.clear();
+    d.xlsx_style_copies.clear();
+    d.xlsx_structural_edits.clear();
+    d.xlsx_structural_dirty = structural_action;
+    if d.original_xlsx.is_none() {
+        return;
+    }
+    if d.saved.sheets.len() != d.wb.sheets.len()
+        || super::file::unsupported_cell_patch_change(&d.saved, &d.wb).is_some()
+    {
+        d.xlsx_structural_dirty = true;
+    }
+    for (sheet_index, (before, after)) in d.saved.sheets.iter().zip(&d.wb.sheets).enumerate() {
+        for cell in before.cells.diff(&after.cells) {
+            d.xlsx_dirty_cells.push((sheet_index, cell));
+        }
+    }
+}
+
 fn undo(s: &mut Session, p: &Json) -> Result<Json> {
     let steps = u32_param(p, "steps").unwrap_or(1).max(1);
     let d = s.doc_mut()?;
@@ -579,15 +604,21 @@ fn undo(s: &mut Session, p: &Json) -> Result<Json> {
             xlsx_style_copies: d.xlsx_style_copies.clone(),
             xlsx_structural_edits: d.xlsx_structural_edits.clone(),
             xlsx_structural_dirty: d.xlsx_structural_dirty,
+            xlsx_epoch: d.xlsx_epoch,
+            structural_action: e.structural_action,
         };
         d.redo.push(cur);
         label = e.label.clone();
+        let stale_epoch = e.xlsx_epoch != d.xlsx_epoch;
         d.wb = e.wb;
         d.selection = e.selection;
         d.xlsx_dirty_cells = e.xlsx_dirty_cells;
         d.xlsx_style_copies = e.xlsx_style_copies;
         d.xlsx_structural_edits = e.xlsx_structural_edits;
         d.xlsx_structural_dirty = e.xlsx_structural_dirty;
+        if stale_epoch {
+            rebase_excel_undo_tracking(d, e.structural_action);
+        }
     }
     d.calc.rebuild(&d.wb);
     d.revision += 1;
@@ -606,15 +637,21 @@ fn redo(s: &mut Session, p: &Json) -> Result<Json> {
             xlsx_style_copies: d.xlsx_style_copies.clone(),
             xlsx_structural_edits: d.xlsx_structural_edits.clone(),
             xlsx_structural_dirty: d.xlsx_structural_dirty,
+            xlsx_epoch: d.xlsx_epoch,
+            structural_action: e.structural_action,
         };
         d.undo.push(cur);
         label = e.label.clone();
+        let stale_epoch = e.xlsx_epoch != d.xlsx_epoch;
         d.wb = e.wb;
         d.selection = e.selection;
         d.xlsx_dirty_cells = e.xlsx_dirty_cells;
         d.xlsx_style_copies = e.xlsx_style_copies;
         d.xlsx_structural_edits = e.xlsx_structural_edits;
         d.xlsx_structural_dirty = e.xlsx_structural_dirty;
+        if stale_epoch {
+            rebase_excel_undo_tracking(d, e.structural_action);
+        }
     }
     d.calc.rebuild(&d.wb);
     d.revision += 1;
