@@ -204,10 +204,15 @@ fn save(s: &mut Session, p: &Json) -> Result<Json> {
                         "This edit cannot be represented by a cell-only package patch ({change})."
                     )));
                 }
-                gridcraft_xlsx::patch_xlsx(original, &d.saved, &d.wb, &d.xlsx_dirty_cells)
+                gridcraft_xlsx::patch_xlsx_with_style_copies(original, &d.saved, &d.wb, &d.xlsx_dirty_cells, &d.xlsx_style_copies)
                     .map_err(|e| EngineError::Other(format!("Safe XLSX patch save failed: {e}")))?
             }
             Some(original) if !d.xlsx_structural_dirty => {
+                if !d.xlsx_style_copies.is_empty() {
+                    return Err(xlsx_preservation_error(
+                        "Combining structural row/column edits with exact Excel format-copy hints is not yet package-safe.",
+                    ));
+                }
                 match gridcraft_xlsx::patch_xlsx_structural(original, &d.saved, &d.wb, &d.xlsx_dirty_cells, &d.xlsx_structural_edits) {
                     Ok(bytes) => bytes,
                     Err(error) if macro_workbook => {
@@ -248,12 +253,14 @@ fn save(s: &mut Session, p: &Json) -> Result<Json> {
         if matches!(kind, crate::io::FileKind::Xlsx) {
             d.original_xlsx = Some(bytes.clone());
             d.xlsx_dirty_cells.clear();
+            d.xlsx_style_copies.clear();
             d.xlsx_structural_edits.clear();
             d.xlsx_structural_dirty = false;
         } else {
             // A JSON save no longer has an XLSX package that corresponds to `saved`.
             d.original_xlsx = None;
             d.xlsx_dirty_cells.clear();
+            d.xlsx_style_copies.clear();
             d.xlsx_structural_edits.clear();
             d.xlsx_structural_dirty = false;
         }
@@ -289,10 +296,15 @@ fn save_bytes(s: &mut Session, p: &Json) -> Result<Json> {
                         "This edit cannot be represented by a cell-only package patch ({change})."
                     )));
                 }
-                gridcraft_xlsx::patch_xlsx(original, &d.saved, &d.wb, &d.xlsx_dirty_cells)
+                gridcraft_xlsx::patch_xlsx_with_style_copies(original, &d.saved, &d.wb, &d.xlsx_dirty_cells, &d.xlsx_style_copies)
                     .map_err(|e| xlsx_preservation_error(&format!("Safe XLSX patch failed ({e}).")))?
             }
             Some(original) if !d.xlsx_structural_dirty => {
+                if !d.xlsx_style_copies.is_empty() {
+                    return Err(xlsx_preservation_error(
+                        "Combining structural edits with exact Excel format-copy hints is not yet package-safe.",
+                    ));
+                }
                 gridcraft_xlsx::patch_xlsx_structural(original, &d.saved, &d.wb, &d.xlsx_dirty_cells, &d.xlsx_structural_edits)
                     .map_err(|e| xlsx_preservation_error(&format!("Safe structural XLSX patch failed ({e}).")))?
             }
