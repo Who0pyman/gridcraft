@@ -265,15 +265,45 @@ fn save_as(s: &mut Session, p: &Json) -> Result<Json> {
 fn save_bytes(s: &mut Session, p: &Json) -> Result<Json> {
     let fmt = str_param(p, "format").unwrap_or("xlsx");
     let d = s.doc()?;
-    if d.original_xlsx.is_some()
-        && macro_enabled_path(d.path.as_deref().unwrap_or(&d.title))
-        && matches!(fmt, "xlsx" | "xlsm" | "xltx" | "xltm")
-    {
-        return Err(macro_preservation_error(
-            "Encoding this workbook through the full XLSX writer would strip its macro-enabled package components.",
-        ));
-    }
-    let bytes = crate::io::save_bytes(&d.wb, &format!("x.{fmt}"))?;
+    let out = format!("x.{fmt}");
+    let kind = crate::io::FileKind::from_path(&out).unwrap_or(crate::io::FileKind::Xlsx);
+    let bytes = if matches!(kind, crate::io::FileKind::Xlsx) {
+        let source_name = d.path.as_deref().unwrap_or(&d.title);
+        if d.original_xlsx.is_some() && macro_enabled_path(source_name) != macro_enabled_path(&out) {
+            return Err(macro_preservation_error(
+                "Changing between macro-enabled and macro-free workbook formats would invalidate the original Excel package.",
+            ));
+        }
+        match &d.original_xlsx {
+            Some(original) if !d.is_dirty() => original.clone(),
+            Some(original) if !d.xlsx_structural_dirty && d.xlsx_structural_edits.is_empty() => {
+                if let Some(change) = unsupported_cell_patch_change(&d.saved, &d.wb) {
+                    return Err(xlsx_preservation_error(&format!(
+                        "This edit cannot be represented by a cell-only package patch ({change})."
+                    )));
+                }
+                gridcraft_xlsx::patch_xlsx(original, &d.saved, &d.wb, &d.xlsx_dirty_cells)
+                    .map_err(|e| xlsx_preservation_error(&format!("Safe XLSX patch failed ({e}).")))?
+            }
+            Some(original) if !d.xlsx_structural_dirty => {
+                gridcraft_xlsx::patch_xlsx_structural(original, &d.saved, &d.wb, &d.xlsx_dirty_cells, &d.xlsx_structural_edits)
+                    .map_err(|e| xlsx_preservation_error(&format!("Safe structural XLSX patch failed ({e}).")))?
+            }
+            Some(_) => {
+                return Err(xlsx_preservation_error(
+                    "This edit requires an unsafe full workbook rewrite.",
+                ));
+            }
+            None if macro_enabled_path(&out) => {
+                return Err(macro_preservation_error(
+                    "Creating a macro-enabled workbook without an original Excel package is unsupported.",
+                ));
+            }
+            None => crate::io::save_bytes(&d.wb, &out)?,
+        }
+    } else {
+        crate::io::save_bytes(&d.wb, &out)?
+    };
     let name = format!("{}.{fmt}", std::path::Path::new(&d.display_title()).file_stem().and_then(|x| x.to_str()).unwrap_or("Book"));
     Ok(json!({"name": name, "base64": crate::io::base64_encode(&bytes), "bytes": bytes.len()}))
 }
