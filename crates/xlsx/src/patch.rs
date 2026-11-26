@@ -2987,3 +2987,57 @@ mod shared_formula_edit_tests {
         assert_eq!(expand_edited_shared_formula_groups(xml, &before, &after, &dirty).unwrap(), xml);
     }
 }
+
+
+#[cfg(test)]
+mod exact_xf_copy_tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn copy_preserves_source_xf_index_when_two_xfs_parse_to_same_style() {
+        // The source uses XF #2. XF #1 has the same modeled Style, so the
+        // normalized style lookup alone would incorrectly choose XF #1.
+        let styles = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font/><font><b/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border/></borders><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" applyFont="1"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" applyFont="1"/></cellXfs></styleSheet>"#;
+        let rels = r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>"#;
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1" s="2"><v>1</v></c><c r="B1"><v>2</v></c></row></sheetData>"#,
+            &[("xl/styles.xml", styles), ("xl/preserved.xml", "<preserved>keep</preserved>")],
+            rels,
+            "",
+        );
+
+        let (base, _) = crate::read_xlsx(&original).unwrap();
+        let mut edited = base.clone();
+        let a1 = CellRef::parse("A1").unwrap();
+        let b1 = CellRef::parse("B1").unwrap();
+        let source = base.sheet(0).unwrap().cell(a1).unwrap().clone();
+        edited.sheet_mut(0).unwrap().set_cell(b1, source);
+
+        let output = patch_xlsx_with_style_copies(&original, &base, &edited, &[(0, b1)], &[(0, a1, 0, b1)]).unwrap();
+        let mut zip = zip::ZipArchive::new(Cursor::new(&output)).unwrap();
+        let mut sheet_xml = String::new();
+        zip.by_name("xl/worksheets/sheet1.xml").unwrap().read_to_string(&mut sheet_xml).unwrap();
+        assert!(sheet_xml.contains(r#"<c r="B1" s="2"><v>1</v></c>"#), "{sheet_xml}");
+        let mut preserved = String::new();
+        zip.by_name("xl/preserved.xml").unwrap().read_to_string(&mut preserved).unwrap();
+        assert_eq!(preserved, "<preserved>keep</preserved>");
+    }
+
+    #[test]
+    fn no_style_copy_hint_keeps_normal_style_resolution() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#,
+            &[("xl/preserved.xml", "<preserved>keep</preserved>")],
+            "",
+            "",
+        );
+        let (base, _) = crate::read_xlsx(&original).unwrap();
+        let mut edited = base.clone();
+        let b1 = CellRef::parse("B1").unwrap();
+        edited.sheet_mut(0).unwrap().set_value(b1, Value::Number(5.0));
+        let baseline = patch_xlsx(&original, &base, &edited, &[(0, b1)]).unwrap();
+        let hinted = patch_xlsx_with_style_copies(&original, &base, &edited, &[(0, b1)], &[]).unwrap();
+        assert_eq!(baseline, hinted);
+    }
+}
