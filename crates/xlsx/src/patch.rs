@@ -1299,6 +1299,104 @@ pub fn patch_xlsx_structural(
     if dirty.is_empty() { Ok(structurally_shifted) } else { patch_xlsx(&structurally_shifted, &shifted_base, wb, &dirty) }
 }
 
+/// Convert an edited shared-formula group into standalone formulas before
+/// replacing one of its cells. Otherwise deleting the master leaves dangling
+/// shared-formula children. Preserve each original cached value and cell style.
+fn expand_edited_shared_formula_groups(
+    source: &str,
+    base: &gridcraft_model::Sheet,
+    after: &gridcraft_model::Sheet,
+    dirty: &BTreeSet<CellRef>,
+) -> Result<String, IoError> {
+    let mut group_ids = BTreeSet::<String>::new();
+
+    for &address in dirty {
+        let before = base.cell(address).and_then(|c| c.formula.as_ref());
+        let after = after.cell(address).and_then(|c| c.formula.as_ref());
+        if before == after {
+            continue;
+        }
+        let Some((start, end, _)) = find_cell_span(source, &address.a1()) else {
+            continue;
+        };
+        let cell = &source[start..end];
+        let Some(f_start) = cell.find("<f") else { continue };
+        let f_end = f_start + cell[f_start..]
+            .find('>')
+            .ok_or_else(|| IoError::Xml("shared formula start tag is unterminated".into()))?;
+        let f_tag = &cell[f_start..=f_end];
+        if attr_value(f_tag, "t").as_deref() == Some("shared") {
+            let si = attr_value(f_tag, "si")
+                .ok_or_else(|| IoError::Format("shared formula group has no si attribute".into()))?;
+            group_ids.insert(si);
+        }
+    }
+
+    if group_ids.is_empty() {
+        return Ok(source.to_string());
+    }
+
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(rel) = source[cursor..].find("<c") {
+        let cell_start = cursor + rel;
+        let next = source.as_bytes().get(cell_start + 2).copied();
+        if !matches!(next, Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') | Some(b'>') | Some(b'/')) {
+            cursor = cell_start + 2;
+            continue;
+        }
+        let tag_end = cell_start + source[cell_start..]
+            .find('>')
+            .ok_or_else(|| IoError::Xml("worksheet cell tag is unterminated".into()))?;
+        let cell_tag = &source[cell_start..=tag_end];
+        if cell_tag.trim_end().ends_with("/>") {
+            cursor = tag_end + 1;
+            continue;
+        }
+        let cell_end = tag_end + 1 + source[tag_end + 1..]
+            .find("</c>")
+            .ok_or_else(|| IoError::Xml("worksheet cell has no closing tag".into()))? + 4;
+        cursor = cell_end;
+        let cell_xml = &source[cell_start..cell_end];
+
+        let Some(relative_f_start) = cell_xml.find("<f") else { continue };
+        let f_start = cell_start + relative_f_start;
+        let f_tag_end = f_start + source[f_start..]
+            .find('>')
+            .ok_or_else(|| IoError::Xml("formula tag is unterminated".into()))?;
+        let f_tag = &source[f_start..=f_tag_end];
+        if attr_value(f_tag, "t").as_deref() != Some("shared") {
+            continue;
+        }
+        let si = attr_value(f_tag, "si")
+            .ok_or_else(|| IoError::Format("shared formula group has no si attribute".into()))?;
+        if !group_ids.contains(&si) {
+            continue;
+        }
+
+        let address = attr_value(cell_tag, "r")
+            .and_then(|s| CellRef::parse(&s))
+            .ok_or_else(|| IoError::Format("shared formula has no valid cell address".into()))?;
+        let formula = base.cell(address).and_then(|c| c.formula.as_ref())
+            .ok_or_else(|| IoError::Format(format!("shared formula missing in model at {}!{}", base.name, address.a1())))?;
+
+        let f_end = if f_tag.trim_end().ends_with("/>") {
+            f_tag_end + 1
+        } else {
+            f_tag_end + 1 + source[f_tag_end + 1..cell_end]
+                .find("</f>")
+                .ok_or_else(|| IoError::Xml("shared formula has no closing tag".into()))? + 4
+        };
+        replacements.push((f_start, f_end, format!("<f>{}</f>", xml::esc(&crate::fmla::to_file(formula)))));
+    }
+
+    let mut result = source.to_string();
+    for (start, end, replacement) in replacements.into_iter().rev() {
+        result.replace_range(start..end, &replacement);
+    }
+    Ok(result)
+}
+
 pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: &[(usize, CellRef)]) -> Result<Vec<u8>, IoError> {
     if dirty_cells.is_empty() {
         return Ok(original.to_vec());
@@ -1355,7 +1453,8 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
 
         let bytes = pkg.read(part)?.ok_or_else(|| IoError::Format(format!("missing worksheet part {part}")))?;
 
-        let mut text = String::from_utf8(bytes).map_err(|_| IoError::Xml(format!("{part} is not UTF-8 XML")))?;
+        let text = String::from_utf8(bytes).map_err(|_| IoError::Xml(format!("{part} is not UTF-8 XML")))?;
+        let mut text = expand_edited_shared_formula_groups(&text, base_sheet, sheet, &refs)?;
 
         struct Edit {
             start: usize,
