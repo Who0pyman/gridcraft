@@ -1397,6 +1397,96 @@ fn expand_edited_shared_formula_groups(
     Ok(result)
 }
 
+/// Patch the sheet's merge list without rebuilding any unrelated OOXML parts.
+/// Excel stores these ranges outside sheetData, so a cell-only patch used to
+/// silently discard copied or newly merged areas.
+fn patch_merged_ranges(
+    source: &str,
+    before: &[gridcraft_core::RangeRef],
+    after: &[gridcraft_core::RangeRef],
+) -> Result<String, IoError> {
+    if before == after {
+        return Ok(source.to_string());
+    }
+    let mut unique = BTreeSet::new();
+    for range in after {
+        if !unique.insert(range.a1()) {
+            return Err(IoError::Format(format!("duplicate merged range {}", range.a1())));
+        }
+    }
+    for (i, a) in after.iter().enumerate() {
+        for b in after.iter().skip(i + 1) {
+            if a.intersects(b) {
+                return Err(IoError::Format(format!("overlapping merged ranges {} and {}", a.a1(), b.a1())));
+            }
+        }
+    }
+
+    let before_refs: BTreeSet<String> = before.iter().map(|r| r.a1()).collect();
+    let mut original_refs = BTreeSet::new();
+    let mut location = None;
+    if let Some(start) = source.find("<mergeCells") {
+        let start_end = start + source[start..]
+            .find('>')
+            .ok_or_else(|| IoError::Xml("unterminated mergeCells start tag".into()))? + 1;
+        let end = if source[start..start_end].trim_end().ends_with("/>") {
+            start_end
+        } else {
+            start_end + source[start_end..]
+                .find("</mergeCells>")
+                .ok_or_else(|| IoError::Xml("unterminated mergeCells element".into()))? + "</mergeCells>".len()
+        };
+
+        let merge_segment = &source[start..end];
+        let mut cursor = 0usize;
+        while let Some(relative) = merge_segment[cursor..].find("<mergeCell") {
+            let tag_start = cursor + relative;
+            let next = merge_segment.as_bytes().get(tag_start + "<mergeCell".len()).copied();
+            if !matches!(next, Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') | Some(b'/') | Some(b'>')) {
+                cursor = tag_start + "<mergeCell".len();
+                continue;
+            }
+            let tag_end = tag_start + merge_segment[tag_start..]
+                .find('>')
+                .ok_or_else(|| IoError::Xml("unterminated mergeCell tag".into()))? + 1;
+            let tag = &merge_segment[tag_start..tag_end];
+            let reference = attr_value(tag, "ref")
+                .ok_or_else(|| IoError::Format("mergeCell has no ref".into()))?;
+            let range = gridcraft_core::RangeRef::parse(&reference)
+                .ok_or_else(|| IoError::Format(format!("invalid mergeCell ref {reference}")))?;
+            original_refs.insert(range.a1());
+            cursor = tag_end;
+        }
+        location = Some((start, end));
+    }
+    if original_refs != before_refs {
+        return Err(IoError::Format(
+            "original merged ranges do not match the imported workbook; refusing lossy merge rewrite".into(),
+        ));
+    }
+
+    let mut replacement = format!("<mergeCells count=\"{}\">", after.len());
+    for range in after {
+        replacement.push_str(&format!("<mergeCell ref=\"{}\"/>", xml::esc_attr(&range.a1())));
+    }
+    replacement.push_str("</mergeCells>");
+
+    let mut result = source.to_string();
+    if let Some((start, end)) = location {
+        result.replace_range(start..end, &replacement);
+    } else {
+        // OOXML order: sheetData, then sheetCalcPr / sheetProtection,
+        // protectedRanges, scenarios, autoFilter, sortState, dataConsolidate,
+        // customSheetViews, mergeCells, conditionalFormatting...
+        // The common no-merge case inserts immediately after sheetData.
+        let data_close = source.find("</sheetData>").map(|p| p + "</sheetData>".len())
+            .or_else(|| source.find("<sheetData").and_then(|p| source[p..].find('>').map(|end| p + end + 1)))
+            .ok_or_else(|| IoError::Xml("worksheet has no sheetData element".into()))?;
+        result.insert_str(data_close, &replacement);
+    }
+    Ok(result)
+}
+
 pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: &[(usize, CellRef)]) -> Result<Vec<u8>, IoError> {
     patch_xlsx_with_style_copies(original, base, wb, dirty_cells, &[])
 }
@@ -1411,7 +1501,9 @@ pub fn patch_xlsx_with_style_copies(
     dirty_cells: &[(usize, CellRef)],
     style_copies: &[(usize, CellRef, usize, CellRef)],
 ) -> Result<Vec<u8>, IoError> {
-    if dirty_cells.is_empty() {
+    if dirty_cells.is_empty()
+        && base.sheets.iter().zip(&wb.sheets).all(|(a, b)| a.merges == b.merges)
+    {
         return Ok(original.to_vec());
     }
 
@@ -1496,6 +1588,11 @@ pub fn patch_xlsx_with_style_copies(
     let mut dirty_by_sheet: BTreeMap<usize, BTreeSet<CellRef>> = BTreeMap::new();
     for &(sheet_index, cell_ref) in dirty_cells {
         dirty_by_sheet.entry(sheet_index).or_default().insert(cell_ref);
+    }
+    for sheet_index in 0..base.sheets.len().min(wb.sheets.len()) {
+        if base.sheet(sheet_index).map(|s| &s.merges) != wb.sheet(sheet_index).map(|s| &s.merges) {
+            dirty_by_sheet.entry(sheet_index).or_default();
+        }
     }
 
     let mut replacements: HashMap<String, Vec<u8>> = HashMap::new();
@@ -1653,6 +1750,7 @@ pub fn patch_xlsx_with_style_copies(
             text.replace_range(start..end, &replacement);
         }
 
+        let text = patch_merged_ranges(&text, &base_sheet.merges, &sheet.merges)?;
         replacements.insert(normalize(part), text.into_bytes());
     }
 
