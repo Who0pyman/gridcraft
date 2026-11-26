@@ -786,6 +786,7 @@ fn paste_special(s: &mut Session, p: &Json) -> Result<Json> {
     let same_doc = s.doc()?.uid == clip.doc_uid;
     let cut_move = clip.cut && same_doc && what == What::All;
     let src_wb = clip.wb.clone();
+    let original_wb = s.doc()?.saved.clone();
     let Some(src_sheet) = src_wb.sheet(clip.sheet) else { return Err(EngineError::Other("The copied sheet no longer exists.".into())) };
     let src_sheet_name = src_sheet.name.clone();
     edit(s, |cx| {
@@ -972,6 +973,18 @@ fn paste_special(s: &mut Session, p: &Json) -> Result<Json> {
                         }
                         if let Some(picture) = new_picture {
                             cx.sheet_mut(dest_sheet)?.cell_pictures.insert(dest, picture);
+                        }
+                        // The Excel XML may have several distinct XF indices that
+                        // GridCraft's normalized StyleTable maps to one StyleId.
+                        // Keep the exact source XF when copying its original style.
+                        let original_style = original_wb.sheet(clip.sheet).and_then(|sh| sh.cell(sc)).map(|c| c.style);
+                        if same_doc
+                            && !cut_move
+                            && matches!(what, What::All | What::Formats)
+                            && src_cell.as_ref().map(|c| c.style) == original_style
+                            && src_cell.is_some()
+                        {
+                            cx.xlsx_style_copies.push((clip.sheet, sc, dest_sheet, dest));
                         }
                         cx.touch(dest_sheet, dest);
                     }
