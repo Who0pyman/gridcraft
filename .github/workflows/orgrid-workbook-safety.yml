@@ -19,6 +19,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Engine workbook protection regression
         run: cargo test -p gridcraft-engine macro_enabled_workbook -- --nocapture
+      - name: Preserve imported XLSX templates
+        run: cargo test -p gridcraft-engine imported_xlsx -- --nocapture
+      - name: Shared-formula normalization regressions
+        run: cargo test -p gridcraft-xlsx shared_formula_edit_tests -- --nocapture
       - name: CLI workbook regression
         run: cargo test -p gridcraft-cli --test cli -- --nocapture
       - name: Build GridCraft CLI for package preservation QA
