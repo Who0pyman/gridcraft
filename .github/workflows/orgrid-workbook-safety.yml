@@ -3,9 +3,11 @@ name: ORGrid workbook preservation
 on:
   pull_request:
     branches: [orgrid-main]
-  push:
-    branches: [chatgpt/protect-xlsm-workbooks]
   workflow_dispatch:
+
+concurrency:
+  group: orgrid-qa-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   excel-preservation:
