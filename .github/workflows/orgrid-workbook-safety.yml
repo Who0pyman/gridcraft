@@ -34,6 +34,12 @@ jobs:
         run: cargo test -p gridcraft-engine imported_title_workbook_rejects_unpatchable_noncell_changes -- --nocapture
       - name: Byte export of macro-enabled packages
         run: cargo test -p gridcraft-engine macro_workbook_byte_export_keeps_original_package_for_noop -- --nocapture
+      - name: Undo and redo preserve Excel save tracking
+        run: cargo test -p gridcraft-engine undo_and_redo_restore -- --nocapture
+      - name: Undo after save round-trip
+        run: cargo test -p gridcraft-engine undo_after_save_rebases_xlsm_cell_edit_against_new_package -- --nocapture
+      - name: Unsafe structural undo after save is blocked
+        run: cargo test -p gridcraft-engine undoing_structural_edit_after_save_refuses_unverified_package_rewrite -- --nocapture
       - name: CLI workbook regression
         run: cargo test -p gridcraft-cli --test cli -- --nocapture
       - name: Build GridCraft CLI for package preservation QA
