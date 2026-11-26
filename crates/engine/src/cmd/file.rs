@@ -99,6 +99,12 @@ fn macro_preservation_error(reason: &str) -> EngineError {
     ))
 }
 
+fn xlsx_preservation_error(reason: &str) -> EngineError {
+    EngineError::Other(format!(
+        "The imported Excel workbook was NOT saved. {reason} GridCraft cannot safely rebuild every original workbook component. The original file is unchanged."
+    ))
+}
+
 fn save(s: &mut Session, p: &Json) -> Result<Json> {
     let path = match str_param(p, "path").map(str::to_string).or_else(|| s.active().and_then(|d| d.path.clone())) {
         Some(p) => p,
@@ -140,12 +146,21 @@ fn save(s: &mut Session, p: &Json) -> Result<Json> {
                             "The structural XLSX patch could not preserve this edit ({error})."
                         )));
                     }
-                    Err(_) => crate::io::save_bytes(&d.wb, &path)?,
+                    Err(error) => {
+                        return Err(xlsx_preservation_error(&format!(
+                            "The structural package-preserving patch failed ({error})."
+                        )));
+                    }
                 }
             }
             Some(_) if macro_workbook => {
                 return Err(macro_preservation_error(
                     "This edit requires a complete workbook rewrite, which would discard unsupported Excel components.",
+                ));
+            }
+            Some(_) => {
+                return Err(xlsx_preservation_error(
+                    "This edit requires a complete workbook rewrite.",
                 ));
             }
             _ => crate::io::save_bytes(&d.wb, &path)?,
