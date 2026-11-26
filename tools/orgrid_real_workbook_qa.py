@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Test a local GridCraft build against a private complex .xlsm workbook.
+
+Never modifies the source file or uploads it to a network service.
+
+Usage:
+  python3 tools/orgrid_real_workbook_qa.py /path/to/gridcraft-cli "/path/to/workbook.xlsm"
+
+This audit checks ordinary edit, exact-style copy, and undo-after-save.
+It compares every decompressed OOXML component, including opaque VBA parts.
+"""
+import argparse
+import json
+import posixpath
+import subprocess
+import sys
+import tempfile
+import zipfile
+from pathlib import Path
+from xml.etree import ElementTree as ET
+
+S = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+P = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+
+
+def package(path):
+    with zipfile.ZipFile(path) as z:
+        broken = z.testzip()
+        if broken:
+            raise AssertionError(f"Bad ZIP CRC: {broken}")
+        return {info.filename: z.read(info.filename)
+                for info in z.infolist() if not info.is_dir()}
+
+
+def sheet_part(parts, sheet_name):
+    root = ET.fromstring(parts["xl/workbook.xml"])
+    item = next((x for x in root.findall(".//" + S + "sheet") if x.get("name") == sheet_name), None)
+    if item is None:
+        raise AssertionError(f"Missing sheet {sheet_name}")
+    rid = item.get(R + "id")
+    rels = ET.fromstring(parts["xl/_rels/workbook.xml.rels"])
+    rel = next((x for x in rels.findall(P + "Relationship") if x.get("Id") == rid), None)
+    if rel is None:
+        raise AssertionError(f"No package relationship for sheet {sheet_name}")
+    target = rel.attrib["Target"].lstrip("/")
+    return target if target.startswith("xl/") else posixpath.normpath("xl/" + target)
+
+
+def cell(parts, sheet, address):
+    part = sheet_part(parts, sheet)
+    root = ET.fromstring(parts[part])
+    return root.find(f".//{S}c[@r='{address}']")
+
+
+def run(cli, input_path, output_path, commands):
+    args = [str(cli), "run", "--in", str(input_path)]
+    for name, data in commands:
+        args.extend(["--cmd", f"{name}={json.dumps(data, separators=(',', ':'))}"])
+    args.extend(["--out", str(output_path), "--quiet"])
+    proc = subprocess.run(args, text=True, capture_output=True, timeout=240)
+    if proc.returncode:
+        raise AssertionError(f"GridCraft returned {proc.returncode}:\n{proc.stderr[-3000:]}")
+    if not output_path.exists():
+        raise AssertionError("Output workbook missing")
+
+
+def compare_components(before, after, allowed):
+    if before.keys() != after.keys():
+        added = sorted(after.keys() - before.keys())
+        missing = sorted(before.keys() - after.keys())
+        raise AssertionError(f"Components added={added}, removed={missing}")
+    changed = {k for k in before if before[k] != after[k]}
+    excess = changed - set(allowed)
+    if excess:
+        raise AssertionError(f"Unexpected changed components: {sorted(excess)}")
+    if not changed:
+        raise AssertionError("Edit did not modify any workbook component")
+    for key in before:
+        if key.endswith("vbaProject.bin") or "/externalLinks/" in key:
+            if before[key] != after[key]:
+                raise AssertionError(f"Private Excel component damaged: {key}")
+    return changed
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("cli", type=Path, help="Compiled gridcraft-cli executable")
+    parser.add_argument("workbook", type=Path, help="Private .xlsm workbook")
+    parser.add_argument("--sheet", default="MI Overview")
+    parser.add_argument("--copy-sheet", default="LEASEHOLD-DS1")
+    parser.add_argument("--source-cell", default="AM18")
+    parser.add_argument("--destination-cell", default="AM900")
+    args = parser.parse_args()
+
+    cli, workbook = args.cli.resolve(), args.workbook.resolve()
+    if not cli.is_file() or not workbook.is_file():
+        parser.error("Both compiled CLI and private workbook must exist")
+    if workbook.suffix.lower() != ".xlsm":
+        parser.error("Use a macro-enabled XLSM copy for this audit")
+
+    original = package(workbook)
+    assert any(k.endswith("vbaProject.bin") for k in original), "Fixture is missing VBA project"
+    change_part = sheet_part(original, args.sheet)
+    copy_part = sheet_part(original, args.copy_sheet)
+    check_cell = "ZZ1000"
+    assert cell(original, args.sheet, check_cell) is None, f"{check_cell} must be an empty QA cell"
+    assert cell(original, args.copy_sheet, args.destination_cell) is None, "Copy destination must be empty"
+
+    with tempfile.TemporaryDirectory(prefix="orgrid-local-qa-") as directory:
+        work = Path(directory)
+
+        basic_file = work / "ordinary.xlsm"
+        run(cli, workbook, basic_file, [
+            ("sheet.activate", {"sheet": args.sheet}),
+            ("cell.set", {"cell": check_cell, "input": "ORGRID QA"}),
+        ])
+        basic = package(basic_file)
+        changes = compare_components(
+            original, basic, {change_part, "xl/sharedStrings.xml", "xl/styles.xml"}
+        )
+        assert cell(basic, args.sheet, check_cell) is not None, "Ordinary edit missing"
+        print("PASS ordinary edit: preserved all unrelated workbook components", sorted(changes))
+
+        copy_file = work / "copy.xlsm"
+        run(cli, workbook, copy_file, [
+            ("sheet.activate", {"sheet": args.copy_sheet}),
+            ("edit.copy", {"range": args.source_cell}),
+            ("edit.paste", {"at": args.destination_cell}),
+        ])
+        copied = package(copy_file)
+        changes = compare_components(original, copied, {copy_part, "xl/styles.xml"})
+        source = cell(original, args.copy_sheet, args.source_cell)
+        dest = cell(copied, args.copy_sheet, args.destination_cell)
+        assert source is not None and dest is not None, "Copied source or destination missing"
+        assert source.get("s", "0") == dest.get("s", "0"), (
+            f"Excel style mismatch: source XF {source.get('s', '0')}, "
+            f"destination XF {dest.get('s', '0')}"
+        )
+        source_formula, dest_formula = source.find(S + "f"), dest.find(S + "f")
+        assert source_formula is not None and dest_formula is not None, "Copied formula missing"
+        print("PASS copy: same exact XF style, formula copied, package intact", sorted(changes))
+
+        first = work / "undo-first.xlsm"
+        final = work / "undo-final.xlsm"
+        run(cli, workbook, final, [
+            ("sheet.activate", {"sheet": args.sheet}),
+            ("cell.set", {"cell": check_cell, "input": "ORGRID MUST BE UNDONE"}),
+            ("file.save", {"path": str(first)}),
+            ("edit.undo", {}),
+            ("file.save", {"path": str(final)}),
+        ])
+        undone = package(final)
+        if cell(undone, args.sheet, check_cell) is not None:
+            raise AssertionError("CRITICAL: Undo after save did not remove the edit")
+        assert undone.keys() == original.keys(), "Undo after save lost workbook components"
+        print("PASS save/undo/save: undone cell absent and all package parts retained")
+
+    print("PASS actual-workbook QA checks. This does not certify VBA execution or full Excel feature parity.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (AssertionError, subprocess.TimeoutExpired, zipfile.BadZipFile, ET.ParseError) as exc:
+        print("FAIL", str(exc), file=sys.stderr)
+        raise SystemExit(1)
