@@ -1759,3 +1759,24 @@ fn macro_workbook_byte_export_keeps_original_package_for_noop() {
     let restored = crate::io::base64_decode(encoded).unwrap();
     assert_eq!(restored, original, "untouched macro-enabled package must be returned unchanged");
 }
+
+#[test]
+fn excel_open_preserves_cached_formula_results_and_rebuilds_dependencies() {
+    let mut wb = gridcraft_model::Workbook::new();
+    let a1 = CellRef::parse("A1").unwrap();
+    let b1 = CellRef::parse("B1").unwrap();
+    let sh = wb.sheet_mut(0).unwrap();
+    sh.set_value(a1, Value::Number(2.0));
+    sh.set_cell(b1, gridcraft_model::Cell {
+        value: Value::Number(999.0),
+        formula: Some(std::sync::Arc::new(gridcraft_model::Formula::new("A1+1"))),
+        style: Default::default(),
+    });
+
+    let excel = crate::DocState::from_excel(wb.clone(), Some("title.xlsm".into()), "title.xlsm".into());
+    assert_eq!(excel.wb.active().unwrap().value(b1), Value::Number(999.0));
+    assert_eq!(excel.calc.graph.len(), 1, "dependency tracking must be rebuilt");
+
+    let fresh = crate::DocState::new(wb, None, "new book".into());
+    assert_eq!(fresh.wb.active().unwrap().value(b1), Value::Number(3.0));
+}
