@@ -84,6 +84,21 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
     )
 }
 
+/// Macro-enabled Excel packages must never pass through GridCraft's full XLSX writer:
+/// that writer does not serialize VBA projects or external workbook relationships.
+fn macro_enabled_path(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("xlsm") || ext.eq_ignore_ascii_case("xltm"))
+}
+
+fn macro_preservation_error(reason: &str) -> EngineError {
+    EngineError::Other(format!(
+        "The macro-enabled workbook was NOT saved. {reason} GridCraft cannot safely rewrite the VBA and external-link parts of this file. Use Excel for this operation; your original file is unchanged."
+    ))
+}
+
 fn save(s: &mut Session, p: &Json) -> Result<Json> {
     let path = match str_param(p, "path").map(str::to_string).or_else(|| s.active().and_then(|d| d.path.clone())) {
         Some(p) => p,
@@ -94,6 +109,21 @@ fn save(s: &mut Session, p: &Json) -> Result<Json> {
     };
     let d = s.doc_mut()?;
     let kind = crate::io::FileKind::from_path(&path).unwrap_or(crate::io::FileKind::Xlsx);
+    let source_name = d.path.as_deref().unwrap_or(&d.title);
+    let macro_workbook = d.original_xlsx.is_some() && macro_enabled_path(source_name);
+
+    if matches!(kind, crate::io::FileKind::Xlsx) {
+        if d.original_xlsx.is_some() && macro_enabled_path(source_name) != macro_enabled_path(&path) {
+            return Err(macro_preservation_error(
+                "Changing between macro-enabled and macro-free workbook formats would invalidate the original Excel package.",
+            ));
+        }
+        if d.original_xlsx.is_none() && macro_enabled_path(&path) {
+            return Err(macro_preservation_error(
+                "Creating a new macro-enabled workbook without an original Excel package is unsupported.",
+            ));
+        }
+    }
 
     let bytes = if matches!(kind, crate::io::FileKind::Xlsx) {
         match &d.original_xlsx {
@@ -105,8 +135,18 @@ fn save(s: &mut Session, p: &Json) -> Result<Json> {
             Some(original) if !d.xlsx_structural_dirty => {
                 match gridcraft_xlsx::patch_xlsx_structural(original, &d.saved, &d.wb, &d.xlsx_dirty_cells, &d.xlsx_structural_edits) {
                     Ok(bytes) => bytes,
+                    Err(error) if macro_workbook => {
+                        return Err(macro_preservation_error(&format!(
+                            "The structural XLSX patch could not preserve this edit ({error})."
+                        )));
+                    }
                     Err(_) => crate::io::save_bytes(&d.wb, &path)?,
                 }
+            }
+            Some(_) if macro_workbook => {
+                return Err(macro_preservation_error(
+                    "This edit requires a complete workbook rewrite, which would discard unsupported Excel components.",
+                ));
             }
             _ => crate::io::save_bytes(&d.wb, &path)?,
         }
@@ -148,6 +188,14 @@ fn save_as(s: &mut Session, p: &Json) -> Result<Json> {
 fn save_bytes(s: &mut Session, p: &Json) -> Result<Json> {
     let fmt = str_param(p, "format").unwrap_or("xlsx");
     let d = s.doc()?;
+    if d.original_xlsx.is_some()
+        && macro_enabled_path(d.path.as_deref().unwrap_or(&d.title))
+        && matches!(fmt, "xlsx" | "xlsm" | "xltx" | "xltm")
+    {
+        return Err(macro_preservation_error(
+            "Encoding this workbook through the full XLSX writer would strip its macro-enabled package components.",
+        ));
+    }
     let bytes = crate::io::save_bytes(&d.wb, &format!("x.{fmt}"))?;
     let name = format!("{}.{fmt}", std::path::Path::new(&d.display_title()).file_stem().and_then(|x| x.to_str()).unwrap_or("Book"));
     Ok(json!({"name": name, "base64": crate::io::base64_encode(&bytes), "bytes": bytes.len()}))
