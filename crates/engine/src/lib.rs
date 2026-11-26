@@ -61,6 +61,8 @@ pub struct HistoryEntry {
     pub xlsx_style_copies: Vec<(usize, CellRef, usize, CellRef)>,
     pub xlsx_structural_edits: Vec<gridcraft_xlsx::StructuralEdit>,
     pub xlsx_structural_dirty: bool,
+    /// Excel package snapshot generation. Saves create a new baseline for undo.
+    pub xlsx_epoch: u64,
 }
 
 /// The clipboard: a block of cells (with formulas and styles) or marching-ants reference.
@@ -111,6 +113,8 @@ pub struct DocState {
     pub xlsx_structural_edits: Vec<gridcraft_xlsx::StructuralEdit>,
     /// True when an unsupported structural change requires the full XLSX writer.
     pub xlsx_structural_dirty: bool,
+    /// Changes when the original Excel package baseline is successfully saved.
+    pub xlsx_epoch: u64,
     /// Per-sheet selection memory.
     pub sheet_selections: Vec<Selection>,
 }
@@ -156,6 +160,7 @@ impl DocState {
             xlsx_style_copies: vec![],
             xlsx_structural_edits: vec![],
             xlsx_structural_dirty: false,
+            xlsx_epoch: 0,
             sheet_selections: vec![],
         }
     }
@@ -310,6 +315,7 @@ impl Session {
             d.xlsx_style_copies.clone(),
             d.xlsx_structural_edits.clone(),
             d.xlsx_structural_dirty,
+            d.xlsx_epoch,
         ));
         let params = if params.is_null() { Json::Object(Default::default()) } else { params };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (spec.run)(self, &params)));
@@ -319,7 +325,7 @@ impl Session {
                 let msg =
                     p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".into());
                 // Restore the workbook as it was.
-                if let Some((uid, wb, sel, dirty_cells, style_copies, structural_edits, structural_dirty)) = &before
+                if let Some((uid, wb, sel, dirty_cells, style_copies, structural_edits, structural_dirty, epoch)) = &before
                     && let Some(d) = self.docs.iter_mut().find(|d| d.uid == *uid)
                 {
                     d.wb = wb.clone();
@@ -328,6 +334,7 @@ impl Session {
                     d.xlsx_style_copies = style_copies.clone();
                     d.xlsx_structural_edits = structural_edits.clone();
                     d.xlsx_structural_dirty = *structural_dirty;
+                    d.xlsx_epoch = *epoch;
                     d.calc.rebuild(&d.wb);
                 }
                 return Err(EngineError::Internal(id.to_string(), msg));
@@ -340,7 +347,7 @@ impl Session {
             }
         }
         if spec.undoable
-            && let Some((uid, wb, sel, dirty_cells, style_copies, structural_edits, structural_dirty)) = before
+            && let Some((uid, wb, sel, dirty_cells, style_copies, structural_edits, structural_dirty, epoch)) = before
             && let Some(d) = self.docs.iter_mut().find(|d| d.uid == uid)
             && !Arc::ptr_eq(&d.wb, &wb)
         {
@@ -352,6 +359,7 @@ impl Session {
                 xlsx_style_copies: style_copies,
                 xlsx_structural_edits: structural_edits,
                 xlsx_structural_dirty: structural_dirty,
+                xlsx_epoch: epoch,
             });
             if d.undo.len() > UNDO_LIMIT {
                 d.undo.remove(0);
