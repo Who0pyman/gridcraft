@@ -256,6 +256,7 @@ fn save(s: &mut Session, p: &Json) -> Result<Json> {
             d.xlsx_style_copies.clear();
             d.xlsx_structural_edits.clear();
             d.xlsx_structural_dirty = false;
+            d.xlsx_epoch = d.xlsx_epoch.wrapping_add(1);
         } else {
             // A JSON save no longer has an XLSX package that corresponds to `saved`.
             d.original_xlsx = None;
