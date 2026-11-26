@@ -573,11 +573,21 @@ fn undo(s: &mut Session, p: &Json) -> Result<Json> {
     let mut label = String::new();
     for _ in 0..steps {
         let Some(e) = d.undo.pop() else { break };
-        let cur = crate::HistoryEntry { label: e.label.clone(), wb: d.wb.clone(), selection: d.selection.clone() };
+        let cur = crate::HistoryEntry {
+            label: e.label.clone(), wb: d.wb.clone(), selection: d.selection.clone(),
+            xlsx_dirty_cells: d.xlsx_dirty_cells.clone(),
+            xlsx_style_copies: d.xlsx_style_copies.clone(),
+            xlsx_structural_edits: d.xlsx_structural_edits.clone(),
+            xlsx_structural_dirty: d.xlsx_structural_dirty,
+        };
         d.redo.push(cur);
         label = e.label.clone();
         d.wb = e.wb;
         d.selection = e.selection;
+        d.xlsx_dirty_cells = e.xlsx_dirty_cells;
+        d.xlsx_style_copies = e.xlsx_style_copies;
+        d.xlsx_structural_edits = e.xlsx_structural_edits;
+        d.xlsx_structural_dirty = e.xlsx_structural_dirty;
     }
     d.calc.rebuild(&d.wb);
     d.revision += 1;
@@ -590,11 +600,21 @@ fn redo(s: &mut Session, p: &Json) -> Result<Json> {
     let mut label = String::new();
     for _ in 0..steps {
         let Some(e) = d.redo.pop() else { break };
-        let cur = crate::HistoryEntry { label: e.label.clone(), wb: d.wb.clone(), selection: d.selection.clone() };
+        let cur = crate::HistoryEntry {
+            label: e.label.clone(), wb: d.wb.clone(), selection: d.selection.clone(),
+            xlsx_dirty_cells: d.xlsx_dirty_cells.clone(),
+            xlsx_style_copies: d.xlsx_style_copies.clone(),
+            xlsx_structural_edits: d.xlsx_structural_edits.clone(),
+            xlsx_structural_dirty: d.xlsx_structural_dirty,
+        };
         d.undo.push(cur);
         label = e.label.clone();
         d.wb = e.wb;
         d.selection = e.selection;
+        d.xlsx_dirty_cells = e.xlsx_dirty_cells;
+        d.xlsx_style_copies = e.xlsx_style_copies;
+        d.xlsx_structural_edits = e.xlsx_structural_edits;
+        d.xlsx_structural_dirty = e.xlsx_structural_dirty;
     }
     d.calc.rebuild(&d.wb);
     d.revision += 1;
