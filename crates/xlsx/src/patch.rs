@@ -1398,6 +1398,19 @@ fn expand_edited_shared_formula_groups(
 }
 
 pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: &[(usize, CellRef)]) -> Result<Vec<u8>, IoError> {
+    patch_xlsx_with_style_copies(original, base, wb, dirty_cells, &[])
+}
+
+/// Same as patch_xlsx, plus original-source OOXML style hints for copy/fill.
+/// Multiple original XF records may normalize to the same model StyleId. A
+/// copied cell must keep its *exact* source XF, not an arbitrary equivalent.
+pub fn patch_xlsx_with_style_copies(
+    original: &[u8],
+    base: &Workbook,
+    wb: &Workbook,
+    dirty_cells: &[(usize, CellRef)],
+    style_copies: &[(usize, CellRef, usize, CellRef)],
+) -> Result<Vec<u8>, IoError> {
     if dirty_cells.is_empty() {
         return Ok(original.to_vec());
     }
@@ -1422,6 +1435,53 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
             };
             if rel.kind == "worksheet" {
                 sheet_parts.push(rel.target.clone());
+            }
+        }
+    }
+
+    // Read the original s="..." XF indices once per source worksheet. This
+    // avoids applying a normalized but visually different style on paste.
+    let mut wanted: BTreeMap<usize, BTreeSet<CellRef>> = BTreeMap::new();
+    for &(src_sheet, src_cell, _, _) in style_copies {
+        wanted.entry(src_sheet).or_default().insert(src_cell);
+    }
+    let mut source_xfs: HashMap<(usize, CellRef), u32> = HashMap::new();
+    for (src_sheet, refs) in wanted {
+        let Some(part) = sheet_parts.get(src_sheet) else { continue };
+        let Some(bytes) = pkg.read(part)? else { continue };
+        let xml_text = std::str::from_utf8(&bytes)
+            .map_err(|_| IoError::Xml(format!("{part} is not UTF-8 XML")))?;
+        let bytes = xml_text.as_bytes();
+        let mut pos = 0usize;
+        while let Some(relative) = xml_text[pos..].find("<c") {
+            let start = pos + relative;
+            let next = bytes.get(start + 2).copied();
+            if !matches!(next, Some(b' ') | Some(b'\\t') | Some(b'\\r') | Some(b'\\n') | Some(b'>') | Some(b'/')) {
+                pos = start + 2;
+                continue;
+            }
+            let end = start + xml_text[start..].find('>')
+                .ok_or_else(|| IoError::Xml("worksheet cell start tag is unterminated".into()))? + 1;
+            let tag = &xml_text[start..end];
+            if let Some(cell) = attr_value(tag, "r").and_then(|r| CellRef::parse(&r))
+                && refs.contains(&cell)
+            {
+                let xf = attr_value(tag, "s").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+                source_xfs.insert((src_sheet, cell), xf);
+                if source_xfs.len() >= style_copies.len() {
+                    break;
+                }
+            }
+            pos = end;
+        }
+    }
+    let mut exact_styles: HashMap<(usize, CellRef), u32> = HashMap::new();
+    for &(src_sheet, src_cell, dst_sheet, dst_cell) in style_copies {
+        let source_style = base.sheet(src_sheet).and_then(|s| s.cell(src_cell)).map(|c| c.style);
+        let target_style = wb.sheet(dst_sheet).and_then(|s| s.cell(dst_cell)).map(|c| c.style);
+        if source_style.is_some() && source_style == target_style {
+            if let Some(&xf) = source_xfs.get(&(src_sheet, src_cell)) {
+                exact_styles.insert((dst_sheet, dst_cell), xf);
             }
         }
     }
@@ -1469,7 +1529,9 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
             let old_style = base_sheet.style_id(cell_ref);
             let new_style = sheet.style_id(cell_ref);
 
-            let style_index = if old_style != new_style {
+            let style_index = if let Some(&exact_xf) = exact_styles.get(&(sheet_index, cell_ref)) {
+                Some(exact_xf)
+            } else if old_style != new_style {
                 if new_style.0 == 0 {
                     Some(0)
                 } else {
