@@ -98,6 +98,10 @@ pub struct DocState {
     pub original_xlsx: Option<Vec<u8>>,
     /// Cells edited since the original XLSX package was loaded/saved.
     pub xlsx_dirty_cells: Vec<gridcraft_calc::Key>,
+    /// Exact original Excel cell styles to carry across same-workbook copy/fill.
+    /// Imported style records can differ in OOXML even when GridCraft's style
+    /// model considers them equal. (source sheet/cell, destination sheet/cell)
+    pub xlsx_style_copies: Vec<(usize, CellRef, usize, CellRef)>,
     /// Structural worksheet edits that can be patched into the original XLSX package.
     pub xlsx_structural_edits: Vec<gridcraft_xlsx::StructuralEdit>,
     /// True when an unsupported structural change requires the full XLSX writer.
@@ -144,6 +148,7 @@ impl DocState {
             title,
             original_xlsx: None,
             xlsx_dirty_cells: vec![],
+            xlsx_style_copies: vec![],
             xlsx_structural_edits: vec![],
             xlsx_structural_dirty: false,
             sheet_selections: vec![],
