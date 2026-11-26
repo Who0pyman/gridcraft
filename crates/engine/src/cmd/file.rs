@@ -134,7 +134,7 @@ fn unsupported_cell_patch_change(before: &gridcraft_model::Workbook, after: &gri
     }
     for (previous, current) in before.sheets.iter().zip(&after.sheets) {
         if previous.name != current.name
-            || previous.rows != current.rows
+            // Safe XLSX patching now writes row heights, hidden rows and outlines.
             || previous.cols != current.cols
             || previous.default_col_width != current.default_col_width
             || previous.default_row_height != current.default_row_height
