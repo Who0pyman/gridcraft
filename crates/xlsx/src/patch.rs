@@ -3149,3 +3149,70 @@ mod exact_xf_copy_tests {
         assert_eq!(baseline, hinted);
     }
 }
+
+
+#[cfg(test)]
+mod merge_preservation_tests {
+    use super::*;
+    use std::io::Read;
+
+    fn read_part(bytes: &[u8], name: &str) -> String {
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut out = String::new();
+        zip.by_name(name).unwrap().read_to_string(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn merged_area_copy_updates_merge_cells_and_no_other_package_part() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>5</v></c></row></sheetData><mergeCells count="1"><mergeCell ref="A1:B1"/></mergeCells>"#,
+            &[("xl/preserved.xml", "<preserved>vba and other parts</preserved>")],
+            "",
+            "",
+        );
+        let (base, _) = crate::read_xlsx(&original).unwrap();
+        let mut edited = base.clone();
+        edited.sheet_mut(0).unwrap().merges.push(gridcraft_core::RangeRef::parse("C4:D4").unwrap());
+
+        let patched = patch_xlsx(&original, &base, &edited, &[]).unwrap();
+        let xml = read_part(&patched, "xl/worksheets/sheet1.xml");
+        assert!(xml.contains(r#"<mergeCells count="2">"#));
+        assert!(xml.contains(r#"<mergeCell ref="A1:B1"/>"#));
+        assert!(xml.contains(r#"<mergeCell ref="C4:D4"/>"#));
+        assert_eq!(
+            read_part(&patched, "xl/preserved.xml"),
+            read_part(&original, "xl/preserved.xml"),
+        );
+        let (roundtrip, _) = crate::read_xlsx(&patched).unwrap();
+        assert!(roundtrip.sheet(0).unwrap().merges.contains(&gridcraft_core::RangeRef::parse("C4:D4").unwrap()));
+    }
+
+    #[test]
+    fn first_merge_is_inserted_before_page_margins() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><pageMargins left="0.3" right="0.3" top="0.2" bottom="0.2" header="0" footer="0"/>"#,
+            &[],
+            "",
+            "",
+        );
+        let (base, _) = crate::read_xlsx(&original).unwrap();
+        let mut edited = base.clone();
+        edited.sheet_mut(0).unwrap().merges.push(gridcraft_core::RangeRef::parse("A1:B1").unwrap());
+        let patched = patch_xlsx(&original, &base, &edited, &[]).unwrap();
+        let xml = read_part(&patched, "xl/worksheets/sheet1.xml");
+        assert!(xml.find("<mergeCells").unwrap() < xml.find("<pageMargins").unwrap());
+        assert!(xml.contains(r#"<mergeCell ref="A1:B1"/>"#));
+    }
+
+    #[test]
+    fn overlapping_merges_are_rejected_instead_of_written() {
+        let original = crate::tests::minimal(r#"<sheetData/>"#, &[], "", "");
+        let (base, _) = crate::read_xlsx(&original).unwrap();
+        let mut edited = base.clone();
+        edited.sheet_mut(0).unwrap().merges.push(gridcraft_core::RangeRef::parse("A1:C1").unwrap());
+        edited.sheet_mut(0).unwrap().merges.push(gridcraft_core::RangeRef::parse("B1:D1").unwrap());
+        let err = patch_xlsx(&original, &base, &edited, &[]).unwrap_err().to_string();
+        assert!(err.contains("overlapping merged ranges"), "{err}");
+    }
+}
