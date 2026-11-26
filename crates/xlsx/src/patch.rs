@@ -1397,6 +1397,110 @@ fn expand_edited_shared_formula_groups(
     Ok(result)
 }
 
+/// Preserve explicit row heights, hidden rows and outline metadata changed by
+/// auto-fit, copy or row formatting. Cell edits otherwise create plain <row r>
+/// elements and silently discard the model's new row height.
+fn patch_row_metadata(
+    source: &str,
+    before: &gridcraft_model::Sheet,
+    after: &gridcraft_model::Sheet,
+) -> Result<String, IoError> {
+    if before.rows == after.rows {
+        return Ok(source.to_string());
+    }
+    let changed: BTreeSet<u32> = before.rows.keys().chain(after.rows.keys()).copied()
+        .filter(|r| before.rows.get(r) != after.rows.get(r)).collect();
+    let mut result = source.to_string();
+    for row in changed {
+        let old_info = before.rows.get(&row);
+        let new_info = after.rows.get(&row);
+        if old_info.and_then(|r| r.style) != new_info.and_then(|r| r.style) {
+            return Err(IoError::Format(format!(
+                "safe worksheet row patch does not yet support changing the row's base style at row {}", row + 1
+            )));
+        }
+        let row_number = row.saturating_add(1);
+        let data_start = result.find("<sheetData")
+            .ok_or_else(|| IoError::Xml("worksheet has no sheetData element".into()))?;
+        let data_tag_end = data_start + result[data_start..].find('>')
+            .ok_or_else(|| IoError::Xml("unterminated sheetData tag".into()))? + 1;
+        let self_closing_data = result[data_start..data_tag_end].trim_end().ends_with("/>");
+        let data_end = if self_closing_data {
+            data_tag_end
+        } else {
+            data_tag_end + result[data_tag_end..].find("</sheetData>")
+                .ok_or_else(|| IoError::Xml("sheetData has no closing tag".into()))?
+        };
+
+        let mut position = data_tag_end;
+        let mut existing = None;
+        if !self_closing_data {
+            while position < data_end {
+                let Some(relative) = result[position..data_end].find("<row") else {
+                    position = data_end;
+                    break;
+                };
+                let row_start = position + relative;
+                let next = result.as_bytes().get(row_start + 4).copied();
+                if !matches!(next, Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') | Some(b'>') | Some(b'/')) {
+                    position = row_start + 4;
+                    continue;
+                }
+                let row_end = row_start + result[row_start..].find('>')
+                    .ok_or_else(|| IoError::Xml("unterminated row tag".into()))? + 1;
+                let xml_row = attr_value(&result[row_start..row_end], "r")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .ok_or_else(|| IoError::Format("worksheet row has no valid number".into()))?;
+                if xml_row == row_number {
+                    existing = Some((row_start, row_end));
+                    position = row_start;
+                    break;
+                }
+                if xml_row > row_number {
+                    position = row_start;
+                    break;
+                }
+                position = row_end;
+            }
+        }
+
+        let mut tag = if let Some((start, end)) = existing {
+            result[start..end].to_string()
+        } else {
+            format!("<row r=\"{row_number}\"/>")
+        };
+        for attr in ["ht", "customHeight", "hidden", "outlineLevel", "collapsed"] {
+            tag = remove_attr(&tag, attr);
+        }
+        if let Some(info) = new_info {
+            if let Some(height) = info.size {
+                tag = set_tag_attr(&tag, "ht", &height.to_string())?;
+                tag = set_tag_attr(&tag, "customHeight", "1")?;
+            }
+            if info.hidden {
+                tag = set_tag_attr(&tag, "hidden", "1")?;
+            }
+            if info.outline > 0 {
+                tag = set_tag_attr(&tag, "outlineLevel", &info.outline.to_string())?;
+            }
+            if info.collapsed {
+                tag = set_tag_attr(&tag, "collapsed", "1")?;
+            }
+        }
+        if let Some((start, end)) = existing {
+            result.replace_range(start..end, &tag);
+        } else if new_info.is_some() {
+            if self_closing_data {
+                let expanded = format!("<sheetData>{tag}</sheetData>");
+                result.replace_range(data_start..data_tag_end, &expanded);
+            } else {
+                result.insert_str(position, &tag);
+            }
+        }
+    }
+    Ok(result)
+}
+
 /// Patch the sheet's merge list without rebuilding any unrelated OOXML parts.
 /// Excel stores these ranges outside sheetData, so a cell-only patch used to
 /// silently discard copied or newly merged areas.
@@ -1512,7 +1616,7 @@ pub fn patch_xlsx_with_style_copies(
     style_copies: &[(usize, CellRef, usize, CellRef)],
 ) -> Result<Vec<u8>, IoError> {
     if dirty_cells.is_empty()
-        && base.sheets.iter().zip(&wb.sheets).all(|(a, b)| a.merges == b.merges)
+        && base.sheets.iter().zip(&wb.sheets).all(|(a, b)| a.merges == b.merges && a.rows == b.rows)
     {
         return Ok(original.to_vec());
     }
@@ -1600,7 +1704,9 @@ pub fn patch_xlsx_with_style_copies(
         dirty_by_sheet.entry(sheet_index).or_default().insert(cell_ref);
     }
     for sheet_index in 0..base.sheets.len().min(wb.sheets.len()) {
-        if base.sheet(sheet_index).map(|s| &s.merges) != wb.sheet(sheet_index).map(|s| &s.merges) {
+        if base.sheet(sheet_index).map(|s| (&s.merges, &s.rows))
+            != wb.sheet(sheet_index).map(|s| (&s.merges, &s.rows))
+        {
             dirty_by_sheet.entry(sheet_index).or_default();
         }
     }
@@ -1760,6 +1866,7 @@ pub fn patch_xlsx_with_style_copies(
             text.replace_range(start..end, &replacement);
         }
 
+        let text = patch_row_metadata(&text, base_sheet, sheet)?;
         let text = patch_merged_ranges(&text, &base_sheet.merges, &sheet.merges)?;
         replacements.insert(normalize(part), text.into_bytes());
     }
