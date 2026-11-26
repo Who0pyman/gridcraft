@@ -100,6 +100,19 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
     patch::patch_xlsx(original, base, wb, dirty_cells)
 }
 
+/// Patches Excel cell edits while retaining the original XF style records for
+/// cells copied from the same workbook. Unlike a full rewrite, unrelated
+/// package parts (VBA, external links, drawings and print settings) survive.
+pub fn patch_xlsx_with_style_copies(
+    original: &[u8],
+    base: &Workbook,
+    wb: &Workbook,
+    dirty_cells: &[(usize, gridcraft_core::CellRef)],
+    style_copies: &[(usize, gridcraft_core::CellRef, usize, gridcraft_core::CellRef)],
+) -> Result<Vec<u8>, IoError> {
+    patch::patch_xlsx_with_style_copies(original, base, wb, dirty_cells, style_copies)
+}
+
 /// Patches supported row/column structural edits into the original XLSX package.
 pub fn patch_xlsx_structural(
     original: &[u8],
