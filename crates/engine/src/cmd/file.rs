@@ -138,7 +138,7 @@ fn unsupported_cell_patch_change(before: &gridcraft_model::Workbook, after: &gri
             || previous.cols != current.cols
             || previous.default_col_width != current.default_col_width
             || previous.default_row_height != current.default_row_height
-            || previous.merges != current.merges
+            // The OOXML save path now patches mergeCells independently.
             || previous.freeze != current.freeze
             || previous.tab_color != current.tab_color
             || previous.visibility != current.visibility
