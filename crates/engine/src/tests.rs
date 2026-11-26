@@ -1648,9 +1648,11 @@ fn macro_enabled_workbook_rejects_destructive_save_fallback() {
     d.original_xlsx = Some(payload);
     d.path = Some("mineral-title.xlsm".to_string());
 
+    // Mark the document dirty as it would be after a user edit.
+    session.execute("cell.set", json!({"cell": "A1", "input": "changed"})).unwrap();
     // Any unsupported structural operation must be rejected, not converted into
     // a fresh workbook that would strip macros and external relationships.
-    d.xlsx_structural_dirty = true;
+    session.doc_mut().unwrap().xlsx_structural_dirty = true;
     let err = session
         .execute("file.save", json!({"path": "/tmp/gridcraft-macro-unsafe-safety-test.xlsm"}))
         .unwrap_err()
