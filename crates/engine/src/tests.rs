@@ -1695,3 +1695,24 @@ fn macro_enabled_workbook_rejects_unsafe_byte_export() {
         .to_string();
     assert!(err.contains("NOT saved"), "{err}");
 }
+
+
+#[test]
+fn imported_xlsx_does_not_silently_drop_unmodelled_parts_on_full_rewrite() {
+    let mut session = s();
+    let package = {
+        let d = session.doc().unwrap();
+        gridcraft_xlsx::write_xlsx(&d.wb).unwrap()
+    };
+    let d = session.doc_mut().unwrap();
+    d.original_xlsx = Some(package);
+    d.path = Some("full-fidelity-title-template.xlsx".to_string());
+    session.execute("cell.set", json!({"cell": "A1", "input": "ORGrid"})).unwrap();
+    session.doc_mut().unwrap().xlsx_structural_dirty = true;
+    let err = session
+        .execute("file.save", json!({"path": "/tmp/gridcraft-xlsx-destructive-save-test.xlsx"}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("NOT saved"), "{err}");
+    assert!(err.contains("complete workbook rewrite"), "{err}");
+}
