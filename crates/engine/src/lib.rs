@@ -56,6 +56,11 @@ pub struct HistoryEntry {
     pub label: String,
     pub wb: Arc<Workbook>,
     pub selection: Selection,
+    /// Original-package edit tracking must move with the undo history.
+    pub xlsx_dirty_cells: Vec<gridcraft_calc::Key>,
+    pub xlsx_style_copies: Vec<(usize, CellRef, usize, CellRef)>,
+    pub xlsx_structural_edits: Vec<gridcraft_xlsx::StructuralEdit>,
+    pub xlsx_structural_dirty: bool,
 }
 
 /// The clipboard: a block of cells (with formulas and styles) or marching-ants reference.
@@ -297,7 +302,15 @@ impl Session {
         if let Err(why) = (spec.enabled)(self) {
             return Err(EngineError::Disabled(id.to_string(), why));
         }
-        let before = self.active().map(|d| (d.uid, d.wb.clone(), d.selection.clone()));
+        let before = self.active().map(|d| (
+            d.uid,
+            d.wb.clone(),
+            d.selection.clone(),
+            d.xlsx_dirty_cells.clone(),
+            d.xlsx_style_copies.clone(),
+            d.xlsx_structural_edits.clone(),
+            d.xlsx_structural_dirty,
+        ));
         let params = if params.is_null() { Json::Object(Default::default()) } else { params };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (spec.run)(self, &params)));
         let result = match result {
@@ -306,11 +319,15 @@ impl Session {
                 let msg =
                     p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".into());
                 // Restore the workbook as it was.
-                if let Some((uid, wb, sel)) = &before
+                if let Some((uid, wb, sel, dirty_cells, style_copies, structural_edits, structural_dirty)) = &before
                     && let Some(d) = self.docs.iter_mut().find(|d| d.uid == *uid)
                 {
                     d.wb = wb.clone();
                     d.selection = sel.clone();
+                    d.xlsx_dirty_cells = dirty_cells.clone();
+                    d.xlsx_style_copies = style_copies.clone();
+                    d.xlsx_structural_edits = structural_edits.clone();
+                    d.xlsx_structural_dirty = *structural_dirty;
                     d.calc.rebuild(&d.wb);
                 }
                 return Err(EngineError::Internal(id.to_string(), msg));
@@ -323,11 +340,19 @@ impl Session {
             }
         }
         if spec.undoable
-            && let Some((uid, wb, sel)) = before
+            && let Some((uid, wb, sel, dirty_cells, style_copies, structural_edits, structural_dirty)) = before
             && let Some(d) = self.docs.iter_mut().find(|d| d.uid == uid)
             && !Arc::ptr_eq(&d.wb, &wb)
         {
-            d.undo.push(HistoryEntry { label: spec.label.trim_end_matches('…').to_string(), wb, selection: sel });
+            d.undo.push(HistoryEntry {
+                label: spec.label.trim_end_matches('…').to_string(),
+                wb,
+                selection: sel,
+                xlsx_dirty_cells: dirty_cells,
+                xlsx_style_copies: style_copies,
+                xlsx_structural_edits: structural_edits,
+                xlsx_structural_dirty: structural_dirty,
+            });
             if d.undo.len() > UNDO_LIMIT {
                 d.undo.remove(0);
             }
