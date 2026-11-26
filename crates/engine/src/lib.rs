@@ -110,9 +110,25 @@ static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 const UNDO_LIMIT: usize = 100;
 
 impl DocState {
-    pub fn new(mut wb: Workbook, path: Option<String>, title: String) -> DocState {
+    pub fn new(wb: Workbook, path: Option<String>, title: String) -> DocState {
+        Self::build(wb, path, title, true)
+    }
+
+    /// Keep Excel's stored calculation results when first opening a workbook.
+    /// Rebuilding the dependency graph is still necessary so later edits recalculate
+    /// their dependents. Unlike a full recalculation, it does not replace caches
+    /// for circular formulas, external links, or functions requiring Excel.
+    pub fn from_excel(wb: Workbook, path: Option<String>, title: String) -> DocState {
+        Self::build(wb, path, title, false)
+    }
+
+    fn build(mut wb: Workbook, path: Option<String>, title: String, recalculate: bool) -> DocState {
         let mut calc = Calc::new();
-        calc.recalc_all(&mut wb);
+        if recalculate {
+            calc.recalc_all(&mut wb);
+        } else {
+            calc.rebuild(&wb);
+        }
         let wb = Arc::new(wb);
         let sel = Selection::at(wb.active().map(|s| s.view_active).unwrap_or_default());
         DocState {
