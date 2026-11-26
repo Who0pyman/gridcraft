@@ -1780,3 +1780,56 @@ fn excel_open_preserves_cached_formula_results_and_rebuilds_dependencies() {
     let fresh = crate::DocState::new(wb, None, "new book".into());
     assert_eq!(fresh.wb.active().unwrap().value(b1), Value::Number(3.0));
 }
+
+#[test]
+fn undo_and_redo_restore_excel_structural_save_tracking() {
+    let mut session = s();
+    let original = {
+        let d = session.doc().unwrap();
+        gridcraft_xlsx::write_xlsx(&d.wb).unwrap()
+    };
+    {
+        let d = session.doc_mut().unwrap();
+        d.original_xlsx = Some(original);
+        d.path = Some("undo-structural.xlsx".into());
+    }
+
+    session.execute("home.insertRows", json!({"rows": "3:3"})).unwrap();
+    assert_eq!(session.doc().unwrap().xlsx_structural_edits.len(), 1);
+
+    session.execute("edit.undo", json!({})).unwrap();
+    assert!(session.doc().unwrap().xlsx_structural_edits.is_empty());
+    assert!(!session.doc().unwrap().xlsx_structural_dirty);
+    assert!(session.doc().unwrap().xlsx_dirty_cells.is_empty());
+
+    session.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(session.doc().unwrap().xlsx_structural_edits.len(), 1);
+}
+
+#[test]
+fn undo_and_redo_restore_exact_excel_style_copy_hints() {
+    let mut session = s();
+    session.execute("cell.set", json!({"cell": "A1", "input": "100"})).unwrap();
+    let original = {
+        let d = session.doc().unwrap();
+        gridcraft_xlsx::write_xlsx(&d.wb).unwrap()
+    };
+    {
+        let d = session.doc_mut().unwrap();
+        d.saved = d.wb.clone();
+        d.original_xlsx = Some(original);
+        d.path = Some("undo-copy.xlsm".into());
+        d.xlsx_dirty_cells.clear();
+    }
+    session.execute("edit.copy", json!({"range": "A1"})).unwrap();
+    session.execute("edit.paste", json!({"at": "B1"})).unwrap();
+    assert_eq!(session.doc().unwrap().xlsx_style_copies.len(), 1);
+
+    session.execute("edit.undo", json!({})).unwrap();
+    assert!(session.doc().unwrap().xlsx_style_copies.is_empty());
+    assert!(session.doc().unwrap().xlsx_dirty_cells.is_empty());
+
+    session.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(session.doc().unwrap().xlsx_style_copies.len(), 1);
+    assert_eq!(session.doc().unwrap().wb.active().unwrap().value(CellRef::parse("B1").unwrap()), Value::Number(100.0));
+}
