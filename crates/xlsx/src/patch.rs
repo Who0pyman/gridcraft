@@ -3323,3 +3323,75 @@ mod merge_preservation_tests {
         assert!(err.contains("overlapping merged ranges"), "{err}");
     }
 }
+
+
+#[cfg(test)]
+mod row_metadata_patch_tests {
+    use super::*;
+    use std::io::Read;
+
+    fn sheet_xml(package: &[u8]) -> String {
+        let mut archive = zip::ZipArchive::new(Cursor::new(package)).unwrap();
+        let mut s = String::new();
+        archive.by_name("xl/worksheets/sheet1.xml").unwrap().read_to_string(&mut s).unwrap();
+        s
+    }
+
+    #[test]
+    fn new_formatted_row_keeps_autofitted_height_after_save() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#,
+            &[("xl/opaque.xml", "<opaque>preserved</opaque>")],
+            "", "",
+        );
+        let (before, _) = crate::read_xlsx(&original).unwrap();
+        let mut after = before.clone();
+        after.sheet_mut(0).unwrap().rows.insert(
+            4,
+            gridcraft_model::LineInfo {
+                size: Some(45.5),
+                ..Default::default()
+            },
+        );
+        let patched = patch_xlsx(&original, &before, &after, &[]).unwrap();
+        let sheet = sheet_xml(&patched);
+        assert!(sheet.contains(r#"<row r="5" ht="45.5" customHeight="1"/>"#), "{sheet}");
+        let mut archive = zip::ZipArchive::new(Cursor::new(&patched)).unwrap();
+        let mut opaque = String::new();
+        archive.by_name("xl/opaque.xml").unwrap().read_to_string(&mut opaque).unwrap();
+        assert_eq!(opaque, "<opaque>preserved</opaque>");
+    }
+
+    #[test]
+    fn changing_existing_row_height_keeps_its_cell_contents() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1" ht="18" customHeight="1"><c r="A1"><v>7</v></c></row></sheetData>"#,
+            &[], "", "",
+        );
+        let (before, _) = crate::read_xlsx(&original).unwrap();
+        let mut after = before.clone();
+        after.sheet_mut(0).unwrap().rows.insert(
+            0,
+            gridcraft_model::LineInfo {size:Some(24.0), hidden:true, ..Default::default()}
+        );
+        let patched = patch_xlsx(&original, &before, &after, &[]).unwrap();
+        let sheet = sheet_xml(&patched);
+        assert!(sheet.contains(r#"ht="24""#), "{sheet}");
+        assert!(sheet.contains(r#"hidden="1""#), "{sheet}");
+        assert!(sheet.contains(r#"<c r="A1"><v>7</v></c>"#), "{sheet}");
+    }
+
+    #[test]
+    fn row_height_can_be_added_to_empty_sheetdata() {
+        let original = crate::tests::minimal(r#"<sheetData/>"#, &[], "", "");
+        let (before, _) = crate::read_xlsx(&original).unwrap();
+        let mut after = before.clone();
+        after.sheet_mut(0).unwrap().rows.insert(
+            2,
+            gridcraft_model::LineInfo {size:Some(30.0), ..Default::default()},
+        );
+        let patched = patch_xlsx(&original, &before, &after, &[]).unwrap();
+        let sheet = sheet_xml(&patched);
+        assert!(sheet.contains(r#"<sheetData><row r="3" ht="30" customHeight="1"/></sheetData>"#), "{sheet}");
+    }
+}
