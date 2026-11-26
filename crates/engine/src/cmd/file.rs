@@ -115,7 +115,7 @@ fn xlsx_preservation_error(reason: &str) -> EngineError {
 /// Package patching writes cell content and styles, not every workbook feature.
 /// If the in-memory model has other edits, returning success would silently lose
 /// those edits while claiming the file was saved. Fail rather than discard them.
-fn unsupported_cell_patch_change(before: &gridcraft_model::Workbook, after: &gridcraft_model::Workbook) -> Option<String> {
+pub(crate) fn unsupported_cell_patch_change(before: &gridcraft_model::Workbook, after: &gridcraft_model::Workbook) -> Option<String> {
     if before.sheets.len() != after.sheets.len() {
         return Some("worksheet count changed".into());
     }
