@@ -1833,3 +1833,68 @@ fn undo_and_redo_restore_exact_excel_style_copy_hints() {
     assert_eq!(session.doc().unwrap().xlsx_style_copies.len(), 1);
     assert_eq!(session.doc().unwrap().wb.active().unwrap().value(CellRef::parse("B1").unwrap()), Value::Number(100.0));
 }
+
+#[test]
+fn undo_after_save_rebases_xlsm_cell_edit_against_new_package() {
+    let mut session = s();
+    session.execute("cell.set", json!({"cell": "B2", "input": "before"})).unwrap();
+
+    let original = {
+        let d = session.doc().unwrap();
+        gridcraft_xlsx::write_xlsx(&d.wb).unwrap()
+    };
+    {
+        let d = session.doc_mut().unwrap();
+        d.saved = d.wb.clone();
+        d.original_xlsx = Some(original);
+        d.path = Some("undo-after-save.xlsm".into());
+        d.xlsx_dirty_cells.clear();
+    }
+    session.execute("cell.set", json!({"cell": "B2", "input": "after"})).unwrap();
+    let target = std::env::temp_dir().join(format!("orgrid-undo-after-save-{}.xlsm", std::process::id()));
+    let target_name = target.to_string_lossy().to_string();
+    session.execute("file.save", json!({"path": target_name})).unwrap();
+    assert_eq!(session.doc().unwrap().xlsx_epoch, 1);
+
+    session.execute("edit.undo", json!({})).unwrap();
+    assert!(session.doc().unwrap().xlsx_dirty_cells.contains(&(0, CellRef::parse("B2").unwrap())));
+    let exported = session.execute("file.saveBytes", json!({"format": "xlsm"})).unwrap();
+    let patched = crate::io::base64_decode(exported["base64"].as_str().unwrap()).unwrap();
+    let (reopened, _) = gridcraft_xlsx::read_xlsx(&patched).unwrap();
+    assert_eq!(reopened.sheet(0).unwrap().value(CellRef::parse("B2").unwrap()), Value::text("before"));
+
+    session.execute("edit.redo", json!({})).unwrap();
+    let exported = session.execute("file.saveBytes", json!({"format": "xlsm"})).unwrap();
+    let restored = crate::io::base64_decode(exported["base64"].as_str().unwrap()).unwrap();
+    let (reopened, _) = gridcraft_xlsx::read_xlsx(&restored).unwrap();
+    assert_eq!(reopened.sheet(0).unwrap().value(CellRef::parse("B2").unwrap()), Value::text("after"));
+    let _ = std::fs::remove_file(target);
+}
+
+#[test]
+fn undoing_structural_edit_after_save_refuses_unverified_package_rewrite() {
+    let mut session = s();
+    let original = {
+        let d = session.doc().unwrap();
+        gridcraft_xlsx::write_xlsx(&d.wb).unwrap()
+    };
+    {
+        let d = session.doc_mut().unwrap();
+        d.original_xlsx = Some(original);
+        d.path = Some("structural-undo.xlsm".into());
+    }
+    session.execute("home.insertRows", json!({"rows":"3:3"})).unwrap();
+    // Simulate a successful structural save establishing a new baseline.
+    {
+        let d = session.doc_mut().unwrap();
+        d.saved = d.wb.clone();
+        d.original_xlsx = Some(gridcraft_xlsx::write_xlsx(&d.wb).unwrap());
+        d.xlsx_structural_edits.clear();
+        d.xlsx_dirty_cells.clear();
+        d.xlsx_epoch = 1;
+    }
+    session.execute("edit.undo", json!({})).unwrap();
+    assert!(session.doc().unwrap().xlsx_structural_dirty);
+    let error = session.execute("file.saveBytes", json!({"format":"xlsm"})).unwrap_err().to_string();
+    assert!(error.contains("NOT saved"), "{error}");
+}
