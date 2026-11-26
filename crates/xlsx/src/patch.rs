@@ -2881,3 +2881,47 @@ mod tests {
         assert_eq!(cell.value, Value::Number(3.0));
     }
 }
+
+
+#[cfg(test)]
+mod shared_formula_edit_tests {
+    use super::*;
+    use std::sync::Arc;
+    use gridcraft_model::{Cell, Formula, Sheet};
+
+    fn formula_at(sheet: &mut Sheet, address: &str, formula: &str, value: f64) {
+        let cell_ref = CellRef::parse(address).unwrap();
+        sheet.set_cell(cell_ref, Cell {
+            value: Value::Number(value),
+            formula: Some(Arc::new(Formula::new(formula))),
+            style: Default::default(),
+        });
+    }
+
+    #[test]
+    fn replacing_shared_formula_master_expands_children_without_losing_cache() {
+        let xml = r#"<worksheet><sheetData><row r="1"><c r="C1"><f t="shared" si="17" ref="C1:C2">A1*2</f><v>4</v></c></row><row r="2"><c r="C2"><f t="shared" si="17"/><v>6</v></c></row></sheetData></worksheet>"#;
+        let mut before = Sheet::new("Example");
+        formula_at(&mut before, "C1", "A1*2", 4.0);
+        formula_at(&mut before, "C2", "A2*2", 6.0);
+        let mut after = before.clone();
+        after.set_value(CellRef::parse("C1").unwrap(), Value::Number(19.0));
+        let dirty = BTreeSet::from([CellRef::parse("C1").unwrap()]);
+
+        let result = expand_edited_shared_formula_groups(xml, &before, &after, &dirty).unwrap();
+        assert!(!result.contains("t=\"shared\""));
+        assert!(result.contains(r#"<c r="C1"><f>A1*2</f><v>4</v></c>"#));
+        assert!(result.contains(r#"<c r="C2"><f>A2*2</f><v>6</v></c>"#));
+    }
+
+    #[test]
+    fn only_style_edit_does_not_rewrite_original_shared_formulas() {
+        let xml = r#"<worksheet><sheetData><row r="1"><c r="C1"><f t="shared" si="17">A1*2</f><v>4</v></c></row></sheetData></worksheet>"#;
+        let mut before = Sheet::new("Example");
+        formula_at(&mut before, "C1", "A1*2", 4.0);
+        let after = before.clone();
+        let dirty = BTreeSet::from([CellRef::parse("C1").unwrap()]);
+
+        assert_eq!(expand_edited_shared_formula_groups(xml, &before, &after, &dirty).unwrap(), xml);
+    }
+}
