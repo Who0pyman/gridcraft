@@ -1741,3 +1741,21 @@ fn imported_title_workbook_rejects_unpatchable_noncell_changes() {
     assert!(err.contains("NOT saved"), "{err}");
     assert!(err.contains("cell-only package patch"), "{err}");
 }
+
+#[test]
+fn macro_workbook_byte_export_keeps_original_package_for_noop() {
+    let mut session = s();
+    let original = {
+        let doc = session.doc().unwrap();
+        gridcraft_xlsx::write_xlsx(&doc.wb).unwrap()
+    };
+    {
+        let doc = session.doc_mut().unwrap();
+        doc.path = Some("title-review.xlsm".to_string());
+        doc.original_xlsx = Some(original.clone());
+    }
+    let result = session.execute("file.saveBytes", json!({"format": "xlsm"})).unwrap();
+    let encoded = result["base64"].as_str().unwrap();
+    let restored = crate::io::base64_decode(encoded).unwrap();
+    assert_eq!(restored, original, "untouched macro-enabled package must be returned unchanged");
+}
