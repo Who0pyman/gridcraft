@@ -62,7 +62,14 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
     {
         s.close_document(0);
     }
-    let mut doc = DocState::new(wb, path, title);
+    // Imported Excel workbooks already contain Excel-calculated caches.
+    // Don't replace those values with GridCraft's results just by opening the file.
+    let is_excel = !imported && matches!(crate::io::FileKind::from_path(&name), Some(crate::io::FileKind::Xlsx));
+    let mut doc = if is_excel {
+        DocState::from_excel(wb, path, title)
+    } else {
+        DocState::new(wb, path, title)
+    };
 
     // ORGrid: retain the original XLSX package so an untouched workbook
     // can be saved without destroying unsupported Excel package parts.
