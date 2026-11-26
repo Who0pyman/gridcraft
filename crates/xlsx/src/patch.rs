@@ -1475,14 +1475,24 @@ fn patch_merged_ranges(
     if let Some((start, end)) = location {
         result.replace_range(start..end, &replacement);
     } else {
-        // OOXML order: sheetData, then sheetCalcPr / sheetProtection,
-        // protectedRanges, scenarios, autoFilter, sortState, dataConsolidate,
-        // customSheetViews, mergeCells, conditionalFormatting...
-        // The common no-merge case inserts immediately after sheetData.
-        let data_close = source.find("</sheetData>").map(|p| p + "</sheetData>".len())
+        // OOXML places mergeCells after sortState/customSheetViews, and
+        // before conditionalFormatting/dataValidations/pageMargins/drawings.
+        // Insert at the first following element with known later schema order.
+        let after_data = source.find("</sheetData>").map(|p| p + "</sheetData>".len())
             .or_else(|| source.find("<sheetData").and_then(|p| source[p..].find('>').map(|end| p + end + 1)))
             .ok_or_else(|| IoError::Xml("worksheet has no sheetData element".into()))?;
-        result.insert_str(data_close, &replacement);
+        let after_tags = [
+            "<conditionalFormatting", "<dataValidations", "<hyperlinks",
+            "<printOptions", "<pageMargins", "<pageSetup", "<headerFooter",
+            "<rowBreaks", "<colBreaks", "<customProperties", "<cellWatches",
+            "<ignoredErrors", "<smartTags", "<drawing", "<legacyDrawing",
+            "<picture", "<oleObjects", "<controls", "<webPublishItems",
+            "<tableParts", "<extLst", "</worksheet>",
+        ];
+        let insert_at = after_tags.iter().filter_map(|tag| {
+            source[after_data..].find(tag).map(|p| after_data + p)
+        }).min().ok_or_else(|| IoError::Xml("worksheet is missing a closing element".into()))?;
+        result.insert_str(insert_at, &replacement);
     }
     Ok(result)
 }
