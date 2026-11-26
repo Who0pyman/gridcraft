@@ -1633,3 +1633,63 @@ fn notes_comments_and_links_survive_a_json_save() {
     assert_eq!(after.hyperlinks, before.hyperlinks);
     assert_eq!(after.cells, before.cells);
 }
+
+#[test]
+fn macro_enabled_workbook_rejects_destructive_save_fallback() {
+    // Simulate an imported macro-enabled Excel package.  The payload deliberately
+    // uses the normal writer's valid XLSX bytes: this test exercises the engine
+    // safety gate without requiring or distributing private VBA binary fixtures.
+    let mut session = s();
+    let payload = {
+        let d = session.doc().unwrap();
+        gridcraft_xlsx::write_xlsx(&d.wb).unwrap()
+    };
+    let d = session.doc_mut().unwrap();
+    d.original_xlsx = Some(payload);
+    d.path = Some("mineral-title.xlsm".to_string());
+
+    // Any unsupported structural operation must be rejected, not converted into
+    // a fresh workbook that would strip macros and external relationships.
+    d.xlsx_structural_dirty = true;
+    let err = session
+        .execute("file.save", json!({"path": "/tmp/gridcraft-macro-unsafe-safety-test.xlsm"}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("NOT saved"), "{err}");
+    assert!(err.contains("complete workbook rewrite"), "{err}");
+}
+
+#[test]
+fn macro_enabled_workbook_cannot_be_disguised_as_xlsx() {
+    let mut session = s();
+    let payload = {
+        let d = session.doc().unwrap();
+        gridcraft_xlsx::write_xlsx(&d.wb).unwrap()
+    };
+    let d = session.doc_mut().unwrap();
+    d.original_xlsx = Some(payload);
+    d.path = Some("mineral-title.xlsm".to_string());
+    let err = session
+        .execute("file.save", json!({"path": "/tmp/gridcraft-macro-unsafe-safety-test.xlsx"}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("macro-enabled"), "{err}");
+    assert!(err.contains("NOT saved"), "{err}");
+}
+
+#[test]
+fn macro_enabled_workbook_rejects_unsafe_byte_export() {
+    let mut session = s();
+    let payload = {
+        let d = session.doc().unwrap();
+        gridcraft_xlsx::write_xlsx(&d.wb).unwrap()
+    };
+    let d = session.doc_mut().unwrap();
+    d.original_xlsx = Some(payload);
+    d.path = Some("mineral-title.xlsm".to_string());
+    let err = session
+        .execute("file.saveBytes", json!({"format": "xlsx"}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("NOT saved"), "{err}");
+}
