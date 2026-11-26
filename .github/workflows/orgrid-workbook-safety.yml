@@ -1,13 +1,9 @@
 name: ORGrid workbook preservation
 
+# Run this QA workflow only when explicitly dispatched. Frequent PR commits were
+# generating redundant GitHub Actions failures and email notifications.
 on:
-  pull_request:
-    branches: [orgrid-main]
   workflow_dispatch:
-
-concurrency:
-  group: orgrid-qa-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
 
 jobs:
   excel-preservation:
