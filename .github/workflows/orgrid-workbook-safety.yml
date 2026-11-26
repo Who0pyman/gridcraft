@@ -22,6 +22,18 @@ jobs:
         run: cargo test -p gridcraft-engine imported_xlsx -- --nocapture
       - name: Shared-formula normalization regressions
         run: cargo test -p gridcraft-xlsx shared_formula_edit_tests -- --nocapture
+      - name: Exact source cell formatting regressions
+        run: cargo test -p gridcraft-xlsx exact_xf_copy_tests -- --nocapture
+      - name: Merge preservation regressions
+        run: cargo test -p gridcraft-xlsx merge_preservation_tests -- --nocapture
+      - name: Row-height and metadata regressions
+        run: cargo test -p gridcraft-xlsx row_metadata_patch_tests -- --nocapture
+      - name: Imported Excel calculation caches
+        run: cargo test -p gridcraft-engine excel_open_preserves_cached_formula_results_and_rebuilds_dependencies -- --nocapture
+      - name: Non-cell metadata preservation
+        run: cargo test -p gridcraft-engine imported_title_workbook_rejects_unpatchable_noncell_changes -- --nocapture
+      - name: Byte export of macro-enabled packages
+        run: cargo test -p gridcraft-engine macro_workbook_byte_export_keeps_original_package_for_noop -- --nocapture
       - name: CLI workbook regression
         run: cargo test -p gridcraft-cli --test cli -- --nocapture
       - name: Build GridCraft CLI for package preservation QA
