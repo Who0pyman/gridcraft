@@ -1716,3 +1716,28 @@ fn imported_xlsx_does_not_silently_drop_unmodelled_parts_on_full_rewrite() {
     assert!(err.contains("NOT saved"), "{err}");
     assert!(err.contains("complete workbook rewrite"), "{err}");
 }
+
+#[test]
+fn imported_title_workbook_rejects_unpatchable_noncell_changes() {
+    let mut session = s();
+    let original_package = {
+        let doc = session.doc().unwrap();
+        gridcraft_xlsx::write_xlsx(&doc.wb).unwrap()
+    };
+    let doc = session.doc_mut().unwrap();
+    doc.original_xlsx = Some(original_package);
+    doc.path = Some("complex-title.xlsm".to_string());
+
+    // Changing workbook properties without a cell edit must not result in a
+    // successful save of the original bytes with the requested change missing.
+    let mut changed = (*doc.wb).clone();
+    changed.props.title = "Title ownership review".into();
+    doc.wb = std::sync::Arc::new(changed);
+
+    let err = session
+        .execute("file.save", json!({"path": "/tmp/gridcraft-unpatchable-noncell-guard.xlsm"}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("NOT saved"), "{err}");
+    assert!(err.contains("cell-only package patch"), "{err}");
+}
