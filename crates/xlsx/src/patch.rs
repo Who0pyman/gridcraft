@@ -1456,7 +1456,7 @@ pub fn patch_xlsx_with_style_copies(
         while let Some(relative) = xml_text[pos..].find("<c") {
             let start = pos + relative;
             let next = bytes.get(start + 2).copied();
-            if !matches!(next, Some(b' ') | Some(b'\\t') | Some(b'\\r') | Some(b'\\n') | Some(b'>') | Some(b'/')) {
+            if !matches!(next, Some(b' ') | Some(b'\${letter}') | Some(b'\${letter}') | Some(b'\${letter}') | Some(b'>') | Some(b'/')) {
                 pos = start + 2;
                 continue;
             }
