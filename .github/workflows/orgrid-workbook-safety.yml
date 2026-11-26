@@ -45,7 +45,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.90.0
+          toolchain: 1.100.0
           targets: aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       - name: Build ad-hoc signed Apple Silicon test installer
