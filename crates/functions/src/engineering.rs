@@ -841,7 +841,9 @@ fn hankel(n: u32, x: f64) -> Option<(f64, f64)> {
     if j.is_finite() && y.is_finite() { Some((j, y)) } else { None }
 }
 
-const EULER: f64 = std::f64::consts::EULER_GAMMA;
+// Euler–Mascheroni constant; std::f64::consts::EULER_GAMMA is not
+// available on the workspace's declared minimum Rust compiler (1.90).
+const EULER: f64 = 0.577_215_664_901_532_9;
 
 /// J_0..J_m(x) for 0 < x ≤ ~100 by Miller's backward recurrence, normalised with
 /// J_0 + 2ΣJ_{2k} = 1.
