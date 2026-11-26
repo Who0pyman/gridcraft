@@ -306,10 +306,10 @@ pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
     }
 
     if wb_rels.iter().any(|r| r.kind == "vbaProject") {
-        cx.warn("macros (VBA project) are not supported and were dropped");
+        cx.warn("VBA macros cannot run in GridCraft. They are retained only when the original Excel package can be preserved during save; unsupported edits must not rewrite a macro-enabled workbook.");
     }
     if wb_rels.iter().any(|r| r.kind == "externalLink") {
-        cx.warn("links to external workbooks are not supported");
+        cx.warn("External workbook links cannot be refreshed or recalculated in GridCraft. Their original XML parts can be retained on package-preserving saves.");
     }
     // Calls of LAMBDA names are spelled like the names (the parser upper-cases them).
     wb.apply_name_call_case();
