@@ -1737,6 +1737,10 @@ pub fn patch_xlsx_with_style_copies(
 
         let mut edits = Vec::new();
         let mut new_cells = Vec::new();
+        let removed_rows: BTreeSet<u32> = refs.iter()
+            .filter(|cell| sheet.cell(**cell).is_none())
+            .map(|cell| cell.row)
+            .collect();
 
         for cell_ref in refs {
             let old_style = base_sheet.style_id(cell_ref);
@@ -1775,6 +1779,12 @@ pub fn patch_xlsx_with_style_copies(
             let a1 = cell_ref.a1();
 
             let Some((start, end, start_tag_end)) = find_cell_span(&text, &a1) else {
+                // A cell absent in both the destination model and original XML
+                // must stay absent. Creating a synthetic blank here changes the
+                // worksheet's used range after an undo.
+                if new_cell.is_none() {
+                    continue;
+                }
                 if old_formula.is_some() {
                     return Err(IoError::Format(format!(
                         "safe XLSX patching found a modeled formula with no original cell at {}!{}",
@@ -1815,6 +1825,23 @@ pub fn patch_xlsx_with_style_copies(
             };
 
             let original_cell = &text[start..end];
+
+            if new_cell.is_none() {
+                // Removing a copied/filled cell must remove its OOXML node,
+                // not leave behind <c r="..." s="..."/>. This matters when
+                // Undo follows a successful Save on a macro-enabled workbook.
+                // Refuse to erase raw XML that wasn't represented in the model.
+                if old_cell.is_none() {
+                    return Err(IoError::Format(format!(
+                        "cannot safely remove an unmodeled Excel cell at {}!{}", sheet.name, a1
+                    )));
+                }
+                if attr_value(&text[start..start_tag_end], "t").as_deref() == Some("s") {
+                    sst.count_delta -= 1;
+                }
+                edits.push(Edit { start, end, replacement: String::new() });
+                continue;
+            }
 
             if let Some(style_index) = style_index
                 && old_formula == new_formula
@@ -1866,7 +1893,20 @@ pub fn patch_xlsx_with_style_copies(
             text.replace_range(start..end, &replacement);
         }
 
-        let text = patch_row_metadata(&text, base_sheet, sheet)?;
+        let mut text = patch_row_metadata(&text, base_sheet, sheet)?;
+        // A newly created row may be empty after Undo. Keep original rows
+        // that have actual content or row properties, but remove synthetic
+        // wrappers that would otherwise expand Excel's used range.
+        for row in removed_rows {
+            if sheet.rows.contains_key(&row)
+                || sheet.cells.row(row, 0, gridcraft_core::MAX_COLS - 1).next().is_some()
+            {
+                continue;
+            }
+            let number = row + 1;
+            text = text.replace(&format!(r#"<row r="{number}"></row>"#), "");
+            text = text.replace(&format!(r#"<row r="{number}"/>"#), "");
+        }
         let text = patch_merged_ranges(&text, &base_sheet.merges, &sheet.merges)?;
         replacements.insert(normalize(part), text.into_bytes());
     }
@@ -3393,5 +3433,67 @@ mod row_metadata_patch_tests {
         let patched = patch_xlsx(&original, &before, &after, &[]).unwrap();
         let sheet = sheet_xml(&patched);
         assert!(sheet.contains(r#"<sheetData><row r="3" ht="30" customHeight="1"/></sheetData>"#), "{sheet}");
+    }
+}
+
+
+#[cfg(test)]
+mod cell_removal_roundtrip_tests {
+    use super::*;
+    use std::io::Read;
+
+    fn worksheet(package: &[u8]) -> String {
+        let mut z = zip::ZipArchive::new(Cursor::new(package)).unwrap();
+        let mut xml = String::new();
+        z.by_name("xl/worksheets/sheet1.xml").unwrap().read_to_string(&mut xml).unwrap();
+        xml
+    }
+
+    #[test]
+    fn deleting_last_cell_removes_synthetic_row_instead_of_leaving_empty_style() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>7</v></c></row></sheetData>"#,
+            &[("xl/opaque.xml", "<opaque>preserve</opaque>")], "", "",
+        );
+        let (base, _) = crate::read_xlsx(&original).unwrap();
+        let mut after = base.clone();
+        after.sheet_mut(0).unwrap().remove_cell(CellRef::parse("A1").unwrap());
+        let patched = patch_xlsx(&original, &base, &after, &[(0, CellRef::parse("A1").unwrap())]).unwrap();
+        let xml = worksheet(&patched);
+        assert!(!xml.contains("A1"), "{xml}");
+        assert!(!xml.contains("<row r=\"1\""), "{xml}");
+        let (roundtrip, _) = crate::read_xlsx(&patched).unwrap();
+        assert!(roundtrip.sheet(0).unwrap().cell(CellRef::parse("A1").unwrap()).is_none());
+    }
+
+    #[test]
+    fn removing_one_of_two_cells_keeps_other_cell_and_row_intact() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>7</v></c><c r="B1"><v>8</v></c></row></sheetData>"#,
+            &[], "", "",
+        );
+        let (base, _) = crate::read_xlsx(&original).unwrap();
+        let mut after = base.clone();
+        after.sheet_mut(0).unwrap().remove_cell(CellRef::parse("A1").unwrap());
+        let patched = patch_xlsx(&original, &base, &after, &[(0, CellRef::parse("A1").unwrap())]).unwrap();
+        let xml = worksheet(&patched);
+        assert!(!xml.contains("<c r=\"A1\""), "{xml}");
+        assert!(xml.contains(r#"<c r="B1"><v>8</v></c>"#), "{xml}");
+        assert!(xml.contains(r#"<row r="1">"#), "{xml}");
+    }
+
+    #[test]
+    fn unmodeled_xml_cell_is_preserved_without_model_change() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>7</v></c></row></sheetData>"#,
+            &[], "", "",
+        );
+        let (mut base, _) = crate::read_xlsx(&original).unwrap();
+        base.sheet_mut(0).unwrap().remove_cell(CellRef::parse("A1").unwrap());
+        let after = base.clone();
+        // The imported model is missing this opaque XML cell, but the
+        // destination does not request its removal. Keep the original part.
+        let patched = patch_xlsx(&original, &base, &after, &[(0, CellRef::parse("A1").unwrap())]).unwrap();
+        assert_eq!(worksheet(&patched), worksheet(&original));
     }
 }
