@@ -1898,3 +1898,36 @@ fn undoing_structural_edit_after_save_refuses_unverified_package_rewrite() {
     let error = session.execute("file.saveBytes", json!({"format":"xlsm"})).unwrap_err().to_string();
     assert!(error.contains("NOT saved"), "{error}");
 }
+
+
+#[test]
+fn imported_excel_edit_persists_recalculated_numeric_formula_results() {
+    use std::sync::Arc;
+    let mut original = gridcraft_model::Workbook::new();
+    let a1 = CellRef::parse("A1").unwrap();
+    let b1 = CellRef::parse("B1").unwrap();
+    original.sheet_mut(0).unwrap().set_value(a1, Value::Number(2.0));
+    original.sheet_mut(0).unwrap().set_cell(b1, gridcraft_model::Cell {
+        value: Value::Number(4.0),
+        formula: Some(Arc::new(gridcraft_model::Formula::new("A1*2"))),
+        style: Default::default(),
+    });
+    let bytes = gridcraft_xlsx::write_xlsx(&original).unwrap();
+    let mut session = s();
+    session.execute("file.open", json!({
+        "name": "mineral-title.xlsx",
+        "base64": crate::io::base64_encode(&bytes)
+    })).unwrap();
+    assert_eq!(v(&session, "B1"), Value::Number(4.0));
+
+    session.execute("cell.set", json!({"cell": "A1", "input": "5"})).unwrap();
+    assert_eq!(v(&session, "B1"), Value::Number(10.0));
+    assert!(session.doc().unwrap().xlsx_dirty_cells.contains(&(0, b1)));
+
+    let export = session.execute("file.saveBytes", json!({"format": "xlsx"})).unwrap();
+    let saved = crate::io::base64_decode(export["base64"].as_str().unwrap()).unwrap();
+    let (reopened, _) = gridcraft_xlsx::read_xlsx(&saved).unwrap();
+    assert_eq!(reopened.sheet(0).unwrap().value(a1), Value::Number(5.0));
+    assert_eq!(reopened.sheet(0).unwrap().value(b1), Value::Number(10.0));
+    assert_eq!(reopened.sheet(0).unwrap().cell(b1).unwrap().formula.as_ref().unwrap().text, "A1*2");
+}
