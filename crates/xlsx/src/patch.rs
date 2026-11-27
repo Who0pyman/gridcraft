@@ -1501,6 +1501,34 @@ fn patch_row_metadata(
     Ok(result)
 }
 
+/// Update only a numeric formula's Excel cached <v> result. Do not touch the
+/// <f> element: it may be a shared formula, array formula or have attributes
+/// that the full GridCraft formula writer cannot safely regenerate.
+fn patch_numeric_formula_cache(xml_cell: &str, result: f64) -> Result<String, IoError> {
+    if !result.is_finite() {
+        return Err(IoError::Format("cannot cache a non-finite Excel formula result".into()));
+    }
+    let cache = format!("<v>{}</v>", xml::num(result));
+    let mut out = xml_cell.to_string();
+    if let Some(start) = xml_cell.find("<v") {
+        let tag_end = start + xml_cell[start..]
+            .find('>')
+            .ok_or_else(|| IoError::Xml("formula cache <v> tag is unterminated".into()))? + 1;
+        let end = if xml_cell[start..tag_end].trim_end().ends_with("/>") {
+            tag_end
+        } else {
+            tag_end + xml_cell[tag_end..].find("</v>")
+                .ok_or_else(|| IoError::Xml("formula cache has no closing </v>".into()))? + "</v>".len()
+        };
+        out.replace_range(start..end, &cache);
+    } else {
+        let insertion = xml_cell.rfind("</c>")
+            .ok_or_else(|| IoError::Format("formula cache cannot be added to a self-closing cell".into()))?;
+        out.insert_str(insertion, &cache);
+    }
+    Ok(out)
+}
+
 /// Patch the sheet's merge list without rebuilding any unrelated OOXML parts.
 /// Excel stores these ranges outside sheetData, so a cell-only patch used to
 /// silently discard copied or newly merged areas.
@@ -1769,10 +1797,23 @@ pub fn patch_xlsx_with_style_copies(
 
             let old_formula = old_cell.and_then(|c| c.formula.as_ref());
             let new_formula = new_cell.and_then(|c| c.formula.as_ref());
+            let cache_number = match (old_cell, new_cell) {
+                (Some(before), Some(after))
+                    if before.value != after.value => match &after.value {
+                        Value::Number(number) if number.is_finite() => Some(*number),
+                        _ => None,
+                    },
+                _ => None,
+            };
 
-            // A dependent formula may have received a new cached result after recalculation.
-            // Preserve an unchanged formula cell exactly; Excel can recalculate it.
-            if old_formula.is_some() && old_formula == new_formula && style_index.is_none() {
+            // Preserve formula XML exactly unless its numeric cache changed or
+            // the cell style itself was edited. Invalid/external calc errors must
+            // never overwrite the original Excel cache.
+            if old_formula.is_some()
+                && old_formula == new_formula
+                && style_index.is_none()
+                && cache_number.is_none()
+            {
                 continue;
             }
 
@@ -1825,6 +1866,24 @@ pub fn patch_xlsx_with_style_copies(
             };
 
             let original_cell = &text[start..end];
+
+            if old_formula.is_some() && old_formula == new_formula {
+                let mut replacement = original_cell.to_string();
+                if let Some(number) = cache_number {
+                    // Numeric formula values (including shared-formula children)
+                    // can be patched without altering the formula structure.
+                    if matches!(attr_value(&text[start..start_tag_end], "t").as_deref(), None | Some("n")) {
+                        replacement = patch_numeric_formula_cache(&replacement, number)?;
+                    }
+                }
+                if let Some(style_index) = style_index {
+                    replacement = set_cell_style(&replacement, style_index)?;
+                }
+                if replacement != original_cell {
+                    edits.push(Edit { start, end, replacement });
+                }
+                continue;
+            }
 
             if new_cell.is_none() {
                 // Removing a copied/filled cell must remove its OOXML node,
