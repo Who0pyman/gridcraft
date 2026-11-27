@@ -46,3 +46,60 @@ jobs:
           name: orgrid-silent-audit-results
           path: qa-results/
           retention-days: 2
+
+  linux-qa-executable:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Compile standalone CLI without failing GitHub notification status
+        shell: bash
+        run: |
+          mkdir -p qa-binary
+          set +e
+          cargo build -p gridcraft-cli >qa-binary/build.log 2>&1
+          echo "$?" >qa-binary/build.exit
+          if test -f target/debug/gridcraft-cli; then cp target/debug/gridcraft-cli qa-binary/; fi
+          echo "CLI build exit=$(cat qa-binary/build.exit)"
+          tail -n 30 qa-binary/build.log
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true
+        with:
+          name: orgrid-latest-linux-cli
+          path: qa-binary/
+          retention-days: 2
+
+  macos-preview:
+    runs-on: macos-15
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.100.0
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Package preview Apple Silicon DMG with result recording
+        shell: bash
+        run: |
+          mkdir -p qa-mac
+          set +e
+          bash packaging/macos/package.sh --arch aarch64 >qa-mac/build.log 2>&1
+          echo "$?" >qa-mac/build.exit
+          cp dist/release/*aarch64.dmg qa-mac/ 2>/dev/null || true
+          echo "Mac package build exit=$(cat qa-mac/build.exit)"
+          tail -n 30 qa-mac/build.log
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true
+        with:
+          name: orgrid-latest-macos-preview
+          path: qa-mac/
+          retention-days: 3
