@@ -46,6 +46,7 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
         s.ui_requests.push(crate::UiRequest::Dialog("open".into(), json!({})));
         return ok();
     };
+    let native_xlsx = s.recent_native_xlsx_exports.iter().any(|export| export == &bytes);
     let (wb, warnings) = crate::io::open_bytes(&name, &bytes)?;
     let imported = matches!(crate::io::FileKind::from_path(&name), Some(crate::io::FileKind::Ods | crate::io::FileKind::Xlsb))
         || matches!(gridcraft_xlsx::sniff(&bytes), gridcraft_xlsx::Format::Ods | gridcraft_xlsx::Format::Xlsb);
@@ -70,6 +71,8 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
     } else {
         DocState::new(wb, path, title)
     };
+
+    doc.native_xlsx = native_xlsx && is_excel && !macro_enabled_path(&name);
 
     // ORGrid: retain the original XLSX package so an untouched workbook
     // can be saved without destroying unsupported Excel package parts.
@@ -195,7 +198,12 @@ fn save(s: &mut Session, p: &Json) -> Result<Json> {
         }
     }
 
-    let bytes = if matches!(kind, crate::io::FileKind::Xlsx) {
+    let bytes = if matches!(kind, crate::io::FileKind::Xlsx) && d.native_xlsx && !macro_workbook {
+        // This is an exact byte-matched native GridCraft export. No foreign
+        // Excel OOXML parts exist, so structural and drawing edits can use
+        // the complete writer just as they did before package preservation.
+        crate::io::save_bytes(&d.wb, &path)?
+    } else if matches!(kind, crate::io::FileKind::Xlsx) {
         match &d.original_xlsx {
             Some(original) if !d.is_dirty() => original.clone(),
             Some(original) if !d.xlsx_structural_dirty && d.xlsx_structural_edits.is_empty() => {
@@ -282,7 +290,9 @@ fn save_bytes(s: &mut Session, p: &Json) -> Result<Json> {
     let d = s.doc()?;
     let out = format!("x.{fmt}");
     let kind = crate::io::FileKind::from_path(&out).unwrap_or(crate::io::FileKind::Xlsx);
-    let bytes = if matches!(kind, crate::io::FileKind::Xlsx) {
+    let bytes = if matches!(kind, crate::io::FileKind::Xlsx) && d.native_xlsx {
+        crate::io::save_bytes(&d.wb, &out)?
+    } else if matches!(kind, crate::io::FileKind::Xlsx) {
         let source_name = d.path.as_deref().unwrap_or(&d.title);
         if d.original_xlsx.is_some() && macro_enabled_path(source_name) != macro_enabled_path(&out) {
             return Err(macro_preservation_error(
@@ -325,6 +335,16 @@ fn save_bytes(s: &mut Session, p: &Json) -> Result<Json> {
         crate::io::save_bytes(&d.wb, &out)?
     };
     let name = format!("{}.{fmt}", std::path::Path::new(&d.display_title()).file_stem().and_then(|x| x.to_str()).unwrap_or("Book"));
+    let is_new_native_export = matches!(kind, crate::io::FileKind::Xlsx)
+        && (d.original_xlsx.is_none() || d.native_xlsx)
+        && !macro_enabled_path(&out);
+    if is_new_native_export && bytes.len() <= 20 * 1024 * 1024 {
+        s.recent_native_xlsx_exports.push(bytes.clone());
+        // Do not retain large or unbounded XLSX data in session history.
+        if s.recent_native_xlsx_exports.len() > 4 {
+            s.recent_native_xlsx_exports.remove(0);
+        }
+    }
     Ok(json!({"name": name, "base64": crate::io::base64_encode(&bytes), "bytes": bytes.len()}))
 }
 
