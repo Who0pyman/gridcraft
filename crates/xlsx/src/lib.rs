@@ -75,6 +75,21 @@ pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
     read::read_xlsx(bytes)
 }
 
+/// Reads the workbook's declared OOXML format independently of the filename.
+pub fn workbook_extension(bytes: &[u8]) -> Result<Option<&'static str>, IoError> {
+    let mut package = package::Package::open(bytes)?;
+    let Some(types) = package.read_xml("[Content_Types].xml")? else {
+        return Ok(None);
+    };
+    Ok(types.kids("Override").find_map(|part| match part.attr("ContentType")? {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml" => Some("xlsx"),
+        "application/vnd.ms-excel.sheet.macroEnabled.main+xml" => Some("xlsm"),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml" => Some("xltx"),
+        "application/vnd.ms-excel.template.macroEnabled.main+xml" => Some("xltm"),
+        _ => None,
+    }))
+}
+
 /// Writes a workbook as an `.xlsx` package.
 pub fn write_xlsx(wb: &Workbook) -> Result<Vec<u8>, IoError> {
     write::write_xlsx(wb)

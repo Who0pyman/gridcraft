@@ -35,6 +35,11 @@ impl FileKind {
     }
 }
 
+pub(crate) fn excel_extension(path: &str) -> Option<&'static str> {
+    let extension = std::path::Path::new(path).extension()?.to_str()?;
+    ["xlsx", "xlsm", "xltx", "xltm"].into_iter().find(|format| extension.eq_ignore_ascii_case(format))
+}
+
 /// Parses a file's bytes into a workbook. `name` picks the format by extension when the bytes
 /// don't say.
 pub fn open_bytes(name: &str, bytes: &[u8]) -> Result<(Workbook, Vec<String>)> {
@@ -275,10 +280,20 @@ pub fn read_file(path: &str) -> Result<Vec<u8>> {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn write_file(path: &str, bytes: &[u8]) -> Result<()> {
-    // Write to a temporary file, then rename: a crash never leaves a half-written workbook.
-    let tmp = format!("{path}.sctmp");
-    std::fs::write(&tmp, bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
-    std::fs::rename(&tmp, path).map_err(|e| EngineError::Other(format!("{path}: {e}")))
+    use std::io::Write as _;
+
+    let target = std::path::Path::new(path);
+    let directory = target.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
+    let report = |error: std::io::Error| EngineError::Other(format!("{path}: {error}"));
+    // A unique sibling file keeps concurrent saves from sharing a staging file.
+    let mut temporary = tempfile::NamedTempFile::new_in(directory).map_err(report)?;
+    if let Ok(metadata) = target.metadata() {
+        temporary.as_file().set_permissions(metadata.permissions()).map_err(report)?;
+    }
+    temporary.write_all(bytes).map_err(report)?;
+    temporary.as_file().sync_all().map_err(report)?;
+    temporary.persist(target).map_err(|error| report(error.error))?;
+    Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]

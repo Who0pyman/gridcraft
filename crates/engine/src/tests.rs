@@ -1931,3 +1931,67 @@ fn imported_excel_edit_persists_recalculated_numeric_formula_results() {
     assert_eq!(reopened.sheet(0).unwrap().value(b1), Value::Number(10.0));
     assert_eq!(reopened.sheet(0).unwrap().cell(b1).unwrap().formula.as_ref().unwrap().text, "A1*2");
 }
+
+#[test]
+fn imported_excel_edit_persists_recalculated_numeric_formula_results_alongside_text_and_boolean() {
+    let mut session = s();
+    session.execute("cell.set", json!({"cell":"A1","input":"0"})).unwrap();
+    session.execute("cell.set", json!({"cell":"B1","input":"=IF(A1=0,7,\"Amended & filed\")"})).unwrap();
+    session.execute("cell.set", json!({"cell":"C1","input":"=A1>0"})).unwrap();
+    let package = gridcraft_xlsx::write_xlsx(&session.doc().unwrap().wb).unwrap();
+
+    session.execute("file.open", json!({"name":"title.xlsx","base64":crate::io::base64_encode(&package)})).unwrap();
+    session.execute("cell.set", json!({"cell":"A1","input":"1"})).unwrap();
+    let saved = session.execute("file.saveBytes", json!({})).unwrap();
+    let bytes = crate::io::base64_decode(saved["base64"].as_str().unwrap()).unwrap();
+    let workbook = gridcraft_xlsx::read_xlsx(&bytes).unwrap().0;
+    assert_eq!(workbook.sheets[0].value(CellRef::parse("B1").unwrap()), Value::text("Amended & filed"));
+    assert_eq!(workbook.sheets[0].value(CellRef::parse("C1").unwrap()), Value::Bool(true));
+}
+
+#[test]
+fn macro_enabled_workbook_format_uses_package_metadata_even_if_misnamed() {
+    use std::io::{Cursor, Read, Write};
+
+    let mut session = s();
+    let workbook = gridcraft_xlsx::write_xlsx(&session.doc().unwrap().wb).unwrap();
+    let mut source = zip::ZipArchive::new(Cursor::new(workbook)).unwrap();
+    let mut target = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for index in 0..source.len() {
+        let mut part = source.by_index(index).unwrap();
+        let mut data = Vec::new();
+        part.read_to_end(&mut data).unwrap();
+        if part.name() == "[Content_Types].xml" {
+            data = String::from_utf8(data).unwrap().replace(
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+                "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
+            ).into_bytes();
+        }
+        target.start_file(part.name(), zip::write::SimpleFileOptions::default()).unwrap();
+        target.write_all(&data).unwrap();
+    }
+    let package = target.finish().unwrap().into_inner();
+
+    session.execute("file.open", json!({"name":"renamed.xlsx","base64":crate::io::base64_encode(&package)})).unwrap();
+    assert_eq!(session.doc().unwrap().excel_save_extension(), "xlsm");
+    assert!(session.execute("file.saveBytes", json!({"format":"xlsx"})).is_err());
+    let saved = session.execute("file.saveBytes", json!({})).unwrap();
+    assert_eq!(saved["name"], "renamed.xlsm");
+    assert_eq!(crate::io::base64_decode(saved["base64"].as_str().unwrap()).unwrap(), package);
+}
+
+#[test]
+fn new_gridcraft_workbook_can_save_and_keep_editing_its_structure() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("native.xlsx").to_string_lossy().into_owned();
+    let mut session = s();
+    session.execute("file.save", json!({"path":path})).unwrap();
+    session.execute("sheet.rename", json!({"name":"Ownership"})).unwrap();
+    session.execute("file.save", json!({})).unwrap();
+    session.execute("file.close", json!({})).unwrap();
+    session.execute("file.open", json!({"path":path})).unwrap();
+    session.execute("sheet.rename", json!({"name":"Assignments"})).unwrap();
+    session.execute("file.save", json!({})).unwrap();
+    let bytes = std::fs::read(path).unwrap();
+    assert_eq!(gridcraft_xlsx::read_xlsx(&bytes).unwrap().0.sheets[0].name, "Assignments");
+}

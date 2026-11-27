@@ -66,16 +66,24 @@ def run(cli, input_path, output_path, commands):
         raise AssertionError("Output workbook missing")
 
 
-def compare_components(before, after, allowed):
-    if before.keys() != after.keys():
-        added = sorted(after.keys() - before.keys())
-        missing = sorted(before.keys() - after.keys())
-        raise AssertionError(f"Components added={added}, removed={missing}")
-    changed = {k for k in before if before[k] != after[k]}
-    excess = changed - set(allowed)
+def compare_components(before, after, allowed, formula_graph_changed=False, allow_no_changes=False):
+    added = after.keys() - before.keys()
+    missing = before.keys() - after.keys()
+    permitted_changes = set(allowed)
+    chain_path = "xl/calcChain.xml"
+    expected_missing = {chain_path} if formula_graph_changed and chain_path in before else set()
+    if added or missing != expected_missing:
+        raise AssertionError(f"Components added={sorted(added)}, removed={sorted(missing)}, expected removed={sorted(expected_missing)}")
+    if expected_missing:
+        metadata = {"[Content_Types].xml", "xl/_rels/workbook.xml.rels"}
+        for part in metadata:
+            assert b"calcChain" not in after[part], f"Stale calculation chain reference in {part}"
+        permitted_changes.update(metadata)
+    changed = {k for k in before.keys() & after.keys() if before[k] != after[k]}
+    excess = changed - permitted_changes
     if excess:
         raise AssertionError(f"Unexpected changed components: {sorted(excess)}")
-    if not changed:
+    if not changed and not allow_no_changes:
         raise AssertionError("Edit did not modify any workbook component")
     for key in before:
         if key.endswith("vbaProject.bin") or "/externalLinks/" in key:
@@ -130,7 +138,7 @@ def main():
             ("edit.paste", {"at": args.destination_cell}),
         ])
         copied = package(copy_file)
-        changes = compare_components(original, copied, {copy_part, "xl/styles.xml"})
+        changes = compare_components(original, copied, {copy_part, "xl/styles.xml"}, formula_graph_changed=True)
         source = cell(original, args.copy_sheet, args.source_cell)
         dest = cell(copied, args.copy_sheet, args.destination_cell)
         assert source is not None and dest is not None, "Copied source or destination missing"
@@ -150,7 +158,11 @@ def main():
             ("edit.paste", {"at": "AJ900"}),
         ])
         merged = package(merged_file)
-        compare_components(original, merged, {copy_part, "xl/styles.xml"})
+        merged_has_formula = any(
+            node is not None and node.find(S + "f") is not None
+            for node in (cell(merged, args.copy_sheet, address) for address in ("AJ900", "AK900"))
+        )
+        compare_components(original, merged, {copy_part, "xl/styles.xml"}, formula_graph_changed=merged_has_formula)
         merged_sheet = ET.fromstring(merged[copy_part])
         merge_refs = {node.get("ref") for node in merged_sheet.iter(S + "mergeCell")}
         assert "AJ900:AK900" in merge_refs, "Copied Excel merged cells were not saved"
@@ -169,7 +181,10 @@ def main():
             ("file.save", {"path": str(merge_undone)}),
         ])
         restored = package(merge_undone)
-        assert restored.keys() == original.keys(), "Undo lost an XLSM component"
+        compare_components(
+            original, restored, {copy_part, "xl/styles.xml"},
+            formula_graph_changed=merged_has_formula, allow_no_changes=True,
+        )
         assert restored[copy_part] == original[copy_part], (
             "Undo left behind copied cell formatting, row records, or merge XML"
         )
@@ -185,7 +200,7 @@ def main():
             ("edit.paste", {"at": "A900"}),
         ])
         row = package(row_file)
-        compare_components(original, row, {copy_part, "xl/styles.xml", "xl/sharedStrings.xml"})
+        compare_components(original, row, {copy_part, "xl/styles.xml", "xl/sharedStrings.xml"}, formula_graph_changed=True)
         original_row = ET.fromstring(original[copy_part])
         copied_row = ET.fromstring(row[copy_part])
         dest_by_ref = {c.get("r"): c for c in copied_row.iter(S + "c")}
@@ -234,7 +249,7 @@ def main():
         recalc = package(recalc_file)
         allowed_calculation_parts = {part for part in original if part.startswith("xl/worksheets/")}
         allowed_calculation_parts.update({"xl/styles.xml", "xl/sharedStrings.xml"})
-        compare_components(original, recalc, allowed_calculation_parts)
+        compare_components(original, recalc, allowed_calculation_parts, formula_graph_changed=True)
         def numeric(parts, address):
             item = cell(parts, args.copy_sheet, address)
             value = item.find(S + "v") if item is not None else None

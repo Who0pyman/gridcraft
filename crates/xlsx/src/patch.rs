@@ -728,24 +728,8 @@ fn structurally_shift_package(original: &[u8], base: &Workbook, edits: &[crate::
         replacements.insert(normalize(part), text.into_bytes());
     }
 
-    let mut archive = zip::ZipArchive::new(Cursor::new(original)).map_err(|e| IoError::Zip(e.to_string()))?;
-    let mut out = ZipOut::new();
-
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i).map_err(|e| IoError::Zip(e.to_string()))?;
-        let name = file.name().to_string();
-
-        let mut bytes = Vec::with_capacity(file.size() as usize);
-        file.read_to_end(&mut bytes).map_err(|e| IoError::Zip(e.to_string()))?;
-
-        if let Some(replacement) = replacements.get(&normalize(&name)) {
-            out.add(&name, replacement)?;
-        } else {
-            out.add(&name, &bytes)?;
-        }
-    }
-
-    out.finish()
+    let removed_chain = remove_calculation_chain(&mut pkg, &wb_part, &wb_rels, &mut replacements)?;
+    rewrite_package(original, &replacements, removed_chain.as_deref())
 }
 
 fn rename_formula_for_sheets(text: &str, renames: &[(String, String)]) -> String {
@@ -1501,32 +1485,38 @@ fn patch_row_metadata(
     Ok(result)
 }
 
-/// Update only a numeric formula's Excel cached <v> result. Do not touch the
-/// <f> element: it may be a shared formula, array formula or have attributes
-/// that the full GridCraft formula writer cannot safely regenerate.
-fn patch_numeric_formula_cache(xml_cell: &str, result: f64) -> Result<String, IoError> {
-    if !result.is_finite() {
-        return Err(IoError::Format("cannot cache a non-finite Excel formula result".into()));
-    }
-    let cache = format!("<v>{}</v>", xml::num(result));
+/// Preserve the original formula element, including shared and array attributes.
+fn patch_formula_cache(xml_cell: &str, cell_type: &str, value: &str) -> Result<String, IoError> {
+    let tag_end = xml_cell.find('>').ok_or_else(|| IoError::Xml("cell start tag is not closed".into()))? + 1;
+    let cache = format!("<v>{value}</v>");
     let mut out = xml_cell.to_string();
-    if let Some(start) = xml_cell.find("<v") {
-        let tag_end = start + xml_cell[start..]
-            .find('>')
-            .ok_or_else(|| IoError::Xml("formula cache <v> tag is unterminated".into()))? + 1;
-        let end = if xml_cell[start..tag_end].trim_end().ends_with("/>") {
-            tag_end
-        } else {
-            tag_end + xml_cell[tag_end..].find("</v>")
-                .ok_or_else(|| IoError::Xml("formula cache has no closing </v>".into()))? + "</v>".len()
-        };
+    if let Some(start) = xml_cell.find("<v>") {
+        let end = start + xml_cell[start..].find("</v>")
+            .ok_or_else(|| IoError::Xml("formula cache has no closing </v>".into()))? + "</v>".len();
         out.replace_range(start..end, &cache);
+    } else if let Some(start) = xml_cell.find("<v/>") {
+        out.replace_range(start..start + "<v/>".len(), &cache);
     } else {
         let insertion = xml_cell.rfind("</c>")
             .ok_or_else(|| IoError::Format("formula cache cannot be added to a self-closing cell".into()))?;
         out.insert_str(insertion, &cache);
     }
+    let start = &xml_cell[..tag_end];
+    if attr_value(start, "t").as_deref().unwrap_or("n") != cell_type {
+        let new_start = set_tag_attr(start, "t", cell_type)?;
+        out.replace_range(..tag_end, &new_start);
+    }
     Ok(out)
+}
+
+/// Keep the Excel cache when GridCraft cannot produce a valid scalar result.
+fn formula_cache_value(value: &Value) -> Option<(&'static str, String)> {
+    match value {
+        Value::Number(number) if number.is_finite() => Some(("n", xml::num(*number))),
+        Value::Text(text) => Some(("str", xml::esc(&xml::encode_xstring(text)))),
+        Value::Bool(value) => Some(("b", u8::from(*value).to_string())),
+        _ => None,
+    }
 }
 
 /// Patch the sheet's merge list without rebuilding any unrelated OOXML parts.
@@ -1627,6 +1617,95 @@ fn patch_merged_ranges(
         result.insert_str(insert_at, &replacement);
     }
     Ok(result)
+}
+
+/// Formula graph edits invalidate Excel's optional calculation chain.
+fn remove_calculation_chain(
+    pkg: &mut Package<'_>,
+    workbook_part: &str,
+    relationships: &[crate::package::Rel],
+    replacements: &mut HashMap<String, Vec<u8>>,
+) -> Result<Option<String>, IoError> {
+    let Some(chain) = relationships.iter().find(|rel| rel.kind == "calcChain" && !rel.external) else {
+        return Ok(None);
+    };
+    let (directory, file) = crate::package::split_dir(workbook_part);
+    let rels_part = if directory.is_empty() { format!("_rels/{file}.rels") } else { format!("{directory}/_rels/{file}.rels") };
+    for (part, element, attribute, value) in [
+        (rels_part.as_str(), "Relationship", "Id", chain.id.as_str()),
+        ("[Content_Types].xml", "Override", "PartName", chain.target.as_str()),
+    ] {
+        let bytes = pkg.read(part)?.ok_or_else(|| IoError::Format(format!("missing package metadata {part}")))?;
+        let mut reader = quick_xml::Reader::from_reader(bytes.as_slice());
+        reader.config_mut().expand_empty_elements = true;
+        let mut spans = Vec::new();
+        let mut pending = None;
+        loop {
+            let start = reader.buffer_position() as usize;
+            match reader.read_event().map_err(|error| IoError::Xml(error.to_string()))? {
+                quick_xml::events::Event::Eof => break,
+                quick_xml::events::Event::Start(tag) if tag.local_name().as_ref() == element.as_bytes() => {
+                    let attr = tag.try_get_attribute(attribute).map_err(|error| IoError::Xml(error.to_string()))?;
+                    if let Some(attr) = attr {
+                        let actual = attr.unescape_value().map_err(|error| IoError::Xml(error.to_string()))?;
+                        let matches = if attribute == "PartName" { normalize(&actual) == normalize(value) } else { actual == value };
+                        if matches {
+                            pending = Some(start);
+                        }
+                    }
+                }
+                quick_xml::events::Event::End(tag) if tag.local_name().as_ref() == element.as_bytes() => {
+                    if let Some(start) = pending.take() {
+                        spans.push(start..reader.buffer_position() as usize);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if spans.is_empty() {
+            return Err(IoError::Format(format!("cannot remove the stale calculation chain from {part}")));
+        }
+        let mut patched = bytes;
+        for span in spans.into_iter().rev() {
+            patched.drain(span);
+        }
+        replacements.insert(normalize(part), patched);
+    }
+    Ok(Some(normalize(&chain.target)))
+}
+
+fn rewrite_package(
+    original: &[u8],
+    replacements: &HashMap<String, Vec<u8>>,
+    removed: Option<&str>,
+) -> Result<Vec<u8>, IoError> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(original)).map_err(|error| IoError::Zip(error.to_string()))?;
+    let mut out = ZipOut::new();
+    let mut total = 0u64;
+    for index in 0..archive.len() {
+        let mut file = archive.by_index(index).map_err(|error| IoError::Zip(error.to_string()))?;
+        let name = file.name().to_string();
+        let key = normalize(&name);
+        if removed == Some(key.as_str()) {
+            continue;
+        }
+        let size = replacements.get(&key).map_or_else(|| file.size(), |part| part.len() as u64);
+        total = total.saturating_add(size);
+        if size > crate::package::MAX_PART || total > crate::package::MAX_TOTAL {
+            return Err(IoError::TooLarge(format!("Excel package exceeds the save limit at {name}")));
+        }
+        if let Some(new_bytes) = replacements.get(&key) {
+            out.add(&name, new_bytes)?;
+        } else {
+            let mut bytes = Vec::new();
+            (&mut file).take(size + 1).read_to_end(&mut bytes).map_err(|error| IoError::Zip(error.to_string()))?;
+            if bytes.len() as u64 != size {
+                return Err(IoError::Zip(format!("invalid decompressed size for {name}")));
+            }
+            out.add(&name, &bytes)?;
+        }
+    }
+    out.finish()
 }
 
 pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: &[(usize, CellRef)]) -> Result<Vec<u8>, IoError> {
@@ -1740,6 +1819,7 @@ pub fn patch_xlsx_with_style_copies(
     }
 
     let mut replacements: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut formulas_changed = false;
 
     for (sheet_index, refs) in dirty_by_sheet {
         let Some(base_sheet) = base.sheet(sheet_index) else {
@@ -1797,23 +1877,13 @@ pub fn patch_xlsx_with_style_copies(
 
             let old_formula = old_cell.and_then(|c| c.formula.as_ref());
             let new_formula = new_cell.and_then(|c| c.formula.as_ref());
-            let cache_number = match (old_cell, new_cell) {
-                (Some(before), Some(after))
-                    if before.value != after.value => match &after.value {
-                        Value::Number(number) if number.is_finite() => Some(*number),
-                        _ => None,
-                    },
+            formulas_changed |= old_formula != new_formula;
+            let cache = match (old_cell, new_cell) {
+                (Some(before), Some(after)) if before.value != after.value => formula_cache_value(&after.value),
                 _ => None,
             };
 
-            // Preserve formula XML exactly unless its numeric cache changed or
-            // the cell style itself was edited. Invalid/external calc errors must
-            // never overwrite the original Excel cache.
-            if old_formula.is_some()
-                && old_formula == new_formula
-                && style_index.is_none()
-                && cache_number.is_none()
-            {
+            if old_formula.is_some() && old_formula == new_formula && style_index.is_none() && cache.is_none() {
                 continue;
             }
 
@@ -1869,12 +1939,8 @@ pub fn patch_xlsx_with_style_copies(
 
             if old_formula.is_some() && old_formula == new_formula {
                 let mut replacement = original_cell.to_string();
-                if let Some(number) = cache_number {
-                    // Numeric formula values (including shared-formula children)
-                    // can be patched without altering the formula structure.
-                    if matches!(attr_value(&text[start..start_tag_end], "t").as_deref(), None | Some("n")) {
-                        replacement = patch_numeric_formula_cache(&replacement, number)?;
-                    }
+                if let Some((cell_type, value)) = cache {
+                    replacement = patch_formula_cache(&replacement, cell_type, &value)?;
                 }
                 if let Some(style_index) = style_index {
                     replacement = set_cell_style(&replacement, style_index)?;
@@ -1985,24 +2051,12 @@ pub fn patch_xlsx_with_style_copies(
         replacements.insert(normalize(part), patched);
     }
 
-    let mut archive = zip::ZipArchive::new(Cursor::new(original)).map_err(|e| IoError::Zip(e.to_string()))?;
-    let mut out = ZipOut::new();
-
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i).map_err(|e| IoError::Zip(e.to_string()))?;
-        let name = file.name().to_string();
-
-        let mut bytes = Vec::with_capacity(file.size() as usize);
-        file.read_to_end(&mut bytes).map_err(|e| IoError::Zip(e.to_string()))?;
-
-        if let Some(replacement) = replacements.get(&normalize(&name)) {
-            out.add(&name, replacement)?;
-        } else {
-            out.add(&name, &bytes)?;
-        }
-    }
-
-    out.finish()
+    let removed_chain = if formulas_changed {
+        remove_calculation_chain(&mut pkg, &wb_part, &wb_rels, &mut replacements)?
+    } else {
+        None
+    };
+    rewrite_package(original, &replacements, removed_chain.as_deref())
 }
 
 fn set_cell_style(cell: &str, style_index: u32) -> Result<String, IoError> {
@@ -3568,6 +3622,54 @@ mod formula_cache_preservation_tests {
         let mut result = String::new();
         archive.by_name("xl/worksheets/sheet1.xml").unwrap().read_to_string(&mut result).unwrap();
         result
+    }
+
+    #[test]
+    fn invalidated_calc_chain_is_removed_with_its_metadata() {
+        let chain_path = "xl/calcChain.xml";
+        let rels_path = "xl/_rels/workbook.xml.rels";
+        let content_types = "[Content_Types].xml";
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><f>1+1</f><v>2</v></c></row></sheetData>"#,
+            &[(chain_path, r#"<calcChain xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><c r="A1" i="1"/></calcChain>"#),
+              ("xl/opaque.xml", "<opaque>keep</opaque>")],
+            r#"<Relationship Id="rIdCalc" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/calcChain" Target="calcChain.xml"/>"#,
+            "",
+        );
+        let types = crate::tests::CT.replace(
+            "</Types>",
+            r#"<Override PartName="/xl/calcChain.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.calcChain+xml"/></Types>"#,
+        );
+        let original = rewrite_package(&original, &HashMap::from([(normalize(content_types), types.into_bytes())]), None).unwrap();
+        let (base, _) = crate::read_xlsx(&original).unwrap();
+        let mut updated = base.clone();
+        let input = CellRef::parse("A1").unwrap();
+        updated.sheet_mut(0).unwrap().cells.get_mut(input).unwrap().value = Value::Number(3.0);
+        let cached_only = patch_xlsx(&original, &base, &updated, &[(0, input)]).unwrap();
+        assert!(Package::open(&cached_only).unwrap().has(chain_path));
+        updated.sheet_mut(0).unwrap().set_value(input, Value::Number(3.0));
+        let patched = patch_xlsx(&original, &base, &updated, &[(0, input)]).unwrap();
+        let mut package = Package::open(&patched).unwrap();
+        assert!(!package.has(chain_path));
+        for part in [rels_path, content_types] {
+            let bytes = package.read(part).unwrap().unwrap();
+            assert!(!String::from_utf8(bytes).unwrap().contains("calcChain"));
+        }
+        assert_eq!(package.read("xl/opaque.xml").unwrap().unwrap(), b"<opaque>keep</opaque>");
+        let (reopened, _) = crate::read_xlsx(&patched).unwrap();
+        assert_eq!(reopened.sheet(0).unwrap().value(input), Value::Number(3.0));
+        assert!(reopened.sheet(0).unwrap().cell(input).unwrap().formula.is_none());
+    }
+
+    #[test]
+    fn result_type_changes_preserve_formula_markup() {
+        let numeric = r#"<c r="C2" s="7"><f t="shared" si="12"/><v>6</v></c>"#;
+        let text = patch_formula_cache(numeric, "str", "Amended &amp; filed").unwrap();
+        assert!(text.contains(r#"t="str""#));
+        assert!(text.contains(r#"<f t="shared" si="12"/><v>Amended &amp; filed</v>"#));
+        let boolean = patch_formula_cache(&text, "b", "1").unwrap();
+        assert!(boolean.contains(r#"t="b""#));
+        assert!(boolean.contains(r#"<f t="shared" si="12"/><v>1</v>"#));
     }
 
     #[test]

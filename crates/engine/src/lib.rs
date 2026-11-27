@@ -105,6 +105,7 @@ pub struct DocState {
     pub title: String,
     /// Original XLSX package bytes, preserved for lossless round-tripping.
     pub original_xlsx: Option<Vec<u8>>,
+    pub(crate) xlsx_extension: Option<&'static str>,
     /// Cells edited since the original XLSX package was loaded/saved.
     pub xlsx_dirty_cells: Vec<gridcraft_calc::Key>,
     /// Exact original Excel cell styles to carry across same-workbook copy/fill.
@@ -161,6 +162,7 @@ impl DocState {
             uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             title,
             original_xlsx: None,
+            xlsx_extension: None,
             xlsx_dirty_cells: vec![],
             xlsx_style_copies: vec![],
             xlsx_structural_edits: vec![],
@@ -175,6 +177,13 @@ impl DocState {
     }
     pub fn sheet_index(&self) -> usize {
         self.wb.active_sheet
+    }
+    /// The Excel format that can preserve this workbook's original package.
+    pub fn excel_save_extension(&self) -> &'static str {
+        self.xlsx_extension.unwrap_or_else(|| {
+            let path = self.path.as_deref().unwrap_or(&self.title);
+            io::excel_extension(path).unwrap_or("xlsx")
+        })
     }
     pub fn display_title(&self) -> String {
         self.path

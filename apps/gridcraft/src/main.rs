@@ -126,8 +126,8 @@ fn services() -> Services {
         })),
         pick_open: Some(Box::new(|| {
             rfd::FileDialog::new()
-                .add_filter("Spreadsheets", &["xlsx", "xlsm", "xlsb", "ods", "csv", "tsv", "txt", "json"])
-                .add_filter("Excel Workbook", &["xlsx", "xlsm"])
+                .add_filter("Spreadsheets", &["xlsx", "xlsm", "xltx", "xltm", "xlsb", "ods", "csv", "tsv", "txt", "json"])
+                .add_filter("Excel Workbook", &["xlsx", "xlsm", "xltx", "xltm"])
                 .add_filter("Excel Binary Workbook (data import)", &["xlsb"])
                 .add_filter("OpenDocument Spreadsheet (data import)", &["ods"])
                 .add_filter("CSV", &["csv"])
@@ -141,10 +141,19 @@ fn services() -> Services {
                 .and_then(|p| p.to_str().map(str::to_string))
         })),
         pick_save: Some(Box::new(|suggested: &str| {
-            let stem = std::path::Path::new(suggested).file_stem().and_then(|s| s.to_str()).unwrap_or("Book1").to_string();
+            let file = std::path::Path::new(suggested);
+            let extension = file.extension().and_then(|ext| ext.to_str()).unwrap_or("xlsx");
+            let label = match extension {
+                "xlsm" => "Excel Macro-Enabled Workbook (.xlsm)",
+                "xltm" => "Excel Macro-Enabled Template (.xltm)",
+                "xltx" => "Excel Template (.xltx)",
+                "csv" => "CSV UTF-8 (.csv)",
+                "html" => "Web Page (.html)",
+                _ => "Excel Workbook (.xlsx)",
+            };
             rfd::FileDialog::new()
-                .set_file_name(format!("{stem}.xlsx"))
-                .add_filter("Excel Workbook (.xlsx)", &["xlsx"])
+                .set_file_name(suggested)
+                .add_filter(label, &[extension])
                 .add_filter("CSV UTF-8 (.csv)", &["csv"])
                 .add_filter("Web Page (.html)", &["html"])
                 .save_file()

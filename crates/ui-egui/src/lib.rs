@@ -393,18 +393,24 @@ impl SheetApp {
                 }
             }
             "saveAs" => {
-                let suggested = self.session.active().map(|d| d.display_title()).unwrap_or_else(|| "Book1".into());
+                let (title, extension) = self.session.active().map(|doc| (doc.display_title(), doc.excel_save_extension()))
+                    .unwrap_or_else(|| ("Book1".into(), "xlsx"));
+                let stem = std::path::Path::new(&title).file_stem().and_then(|name| name.to_str()).unwrap_or("Book1");
                 if let Some(pick) = &self.services.pick_save {
-                    if let Some(path) = pick(&suggested) {
-                        let path = if std::path::Path::new(&path).extension().is_none() { format!("{path}.xlsx") } else { path };
+                    if let Some(path) = pick(&format!("{stem}.{extension}")) {
+                        let path = if std::path::Path::new(&path).extension().is_none() { format!("{path}.{extension}") } else { path };
                         self.run_or_alert("file.save", json!({"path": path}));
                     }
-                } else if let Some(dl) = &self.services.download
-                    && let Ok(r) = self.session.run("file.saveBytes", json!({"format": "xlsx"}))
-                    && let Some(b) = r.get("base64").and_then(Json::as_str).and_then(gridcraft_engine::io::base64_decode)
-                {
-                    let name = r.get("name").and_then(Json::as_str).unwrap_or("Book.xlsx").to_string();
-                    dl(&name, &b);
+                } else if let Some(download) = &self.services.download {
+                    match self.session.run("file.saveBytes", json!({})) {
+                        Ok(result) => {
+                            if let Some(bytes) = result.get("base64").and_then(Json::as_str).and_then(gridcraft_engine::io::base64_decode) {
+                                let name = result.get("name").and_then(Json::as_str).unwrap_or("Book.xlsx");
+                                download(name, &bytes);
+                            }
+                        }
+                        Err(error) => self.message = Some(("GridCraft".into(), clean_error(&error))),
+                    }
                 }
             }
             other => self.dialog = dialogs::Dialog::open(self, other, params),
