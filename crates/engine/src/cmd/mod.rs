@@ -297,6 +297,12 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
     // Excel package instead of rebuilding the entire workbook.
     if d.original_xlsx.is_some() {
         d.xlsx_dirty_cells.extend(changed.iter().cloned());
+        if !structural {
+            // Dependent formulas were recalculated in memory. Their supported
+            // cached results must also be saved, or reopening the XLSM would
+            // show stale WI/NRI percentages even though the edit was saved.
+            d.xlsx_dirty_cells.extend(d.calc.last_recalc_changed.iter().copied());
+        }
         // A later edit of the same destination must invalidate any earlier
         // copy hint before replacing it with the most recent one.
         d.xlsx_style_copies.retain(|(_, _, si, dest)| !changed.contains(&(*si, *dest)));
