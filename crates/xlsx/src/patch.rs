@@ -3556,3 +3556,68 @@ mod cell_removal_roundtrip_tests {
         assert_eq!(worksheet(&patched), worksheet(&original));
     }
 }
+
+
+#[cfg(test)]
+mod formula_cache_preservation_tests {
+    use super::*;
+    use std::io::Read;
+
+    fn xml_sheet(package: &[u8]) -> String {
+        let mut archive = zip::ZipArchive::new(Cursor::new(package)).unwrap();
+        let mut result = String::new();
+        archive.by_name("xl/worksheets/sheet1.xml").unwrap().read_to_string(&mut result).unwrap();
+        result
+    }
+
+    #[test]
+    fn changed_dependent_formula_value_survives_excel_reopen() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>2</v></c><c r="B1"><f>A1*2</f><v>4</v></c></row></sheetData>"#,
+            &[("xl/opaque.xml", "<opaque>keep</opaque>")], "", "",
+        );
+        let (base, _) = crate::read_xlsx(&original).unwrap();
+        let mut updated = base.clone();
+        let b1 = CellRef::parse("B1").unwrap();
+        updated.sheet_mut(0).unwrap().cells.get_mut(b1).unwrap().value = Value::Number(10.0);
+        let patched = patch_xlsx(&original, &base, &updated, &[(0, b1)]).unwrap();
+        let sheet = xml_sheet(&patched);
+        assert!(sheet.contains("<f>A1*2</f><v>10</v>"), "{sheet}");
+        let (reopened, _) = crate::read_xlsx(&patched).unwrap();
+        assert_eq!(reopened.sheet(0).unwrap().value(b1), Value::Number(10.0));
+        assert_eq!(reopened.sheet(0).unwrap().cell(b1).unwrap().formula.as_ref().unwrap().text, "A1*2");
+    }
+
+    #[test]
+    fn updated_shared_formula_cache_keeps_original_master_and_child_markup() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>2</v></c><c r="C1"><f t="shared" si="7" ref="C1:C2">A1*2</f><v>4</v></c></row><row r="2"><c r="A2"><v>3</v></c><c r="C2"><f t="shared" si="7"/><v>6</v></c></row></sheetData>"#,
+            &[("xl/opaque.xml", "<opaque>keep</opaque>")], "", "",
+        );
+        let (base, _) = crate::read_xlsx(&original).unwrap();
+        let mut updated = base.clone();
+        let c2 = CellRef::parse("C2").unwrap();
+        updated.sheet_mut(0).unwrap().cells.get_mut(c2).unwrap().value = Value::Number(9.0);
+        let patched = patch_xlsx(&original, &base, &updated, &[(0, c2)]).unwrap();
+        let sheet = xml_sheet(&patched);
+        assert!(sheet.contains(r#"<f t="shared" si="7" ref="C1:C2">A1*2</f><v>4</v>"#), "{sheet}");
+        assert!(sheet.contains(r#"<f t="shared" si="7"/><v>9</v>"#), "{sheet}");
+        let (reopened, _) = crate::read_xlsx(&patched).unwrap();
+        assert_eq!(reopened.sheet(0).unwrap().value(c2), Value::Number(9.0));
+    }
+
+    #[test]
+    fn unsupported_recalculation_error_never_replaces_excel_cached_number() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>2</v></c><c r="B1"><f>A1*2</f><v>4</v></c></row></sheetData>"#,
+            &[], "", "",
+        );
+        let (base, _) = crate::read_xlsx(&original).unwrap();
+        let mut updated = base.clone();
+        let b1 = CellRef::parse("B1").unwrap();
+        updated.sheet_mut(0).unwrap().cells.get_mut(b1).unwrap().value =
+            Value::Error(gridcraft_core::CellError::Name);
+        let patched = patch_xlsx(&original, &base, &updated, &[(0, b1)]).unwrap();
+        assert_eq!(xml_sheet(&patched), xml_sheet(&original));
+    }
+}
