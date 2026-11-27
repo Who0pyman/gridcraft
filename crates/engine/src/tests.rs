@@ -1633,3 +1633,301 @@ fn notes_comments_and_links_survive_a_json_save() {
     assert_eq!(after.hyperlinks, before.hyperlinks);
     assert_eq!(after.cells, before.cells);
 }
+
+#[test]
+fn macro_enabled_workbook_rejects_destructive_save_fallback() {
+    // Simulate an imported macro-enabled Excel package.  The payload deliberately
+    // uses the normal writer's valid XLSX bytes: this test exercises the engine
+    // safety gate without requiring or distributing private VBA binary fixtures.
+    let mut session = s();
+    let payload = {
+        let d = session.doc().unwrap();
+        gridcraft_xlsx::write_xlsx(&d.wb).unwrap()
+    };
+    let d = session.doc_mut().unwrap();
+    d.original_xlsx = Some(payload);
+    d.path = Some("mineral-title.xlsm".to_string());
+
+    // Mark the document dirty as it would be after a user edit.
+    session.execute("cell.set", json!({"cell": "A1", "input": "changed"})).unwrap();
+    // Any unsupported structural operation must be rejected, not converted into
+    // a fresh workbook that would strip macros and external relationships.
+    session.doc_mut().unwrap().xlsx_structural_dirty = true;
+    let err = session
+        .execute("file.save", json!({"path": "/tmp/gridcraft-macro-unsafe-safety-test.xlsm"}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("NOT saved"), "{err}");
+    assert!(err.contains("complete workbook rewrite"), "{err}");
+}
+
+#[test]
+fn macro_enabled_workbook_cannot_be_disguised_as_xlsx() {
+    let mut session = s();
+    let payload = {
+        let d = session.doc().unwrap();
+        gridcraft_xlsx::write_xlsx(&d.wb).unwrap()
+    };
+    let d = session.doc_mut().unwrap();
+    d.original_xlsx = Some(payload);
+    d.path = Some("mineral-title.xlsm".to_string());
+    let err = session
+        .execute("file.save", json!({"path": "/tmp/gridcraft-macro-unsafe-safety-test.xlsx"}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("macro-enabled"), "{err}");
+    assert!(err.contains("NOT saved"), "{err}");
+}
+
+#[test]
+fn macro_enabled_workbook_rejects_unsafe_byte_export() {
+    let mut session = s();
+    let payload = {
+        let d = session.doc().unwrap();
+        gridcraft_xlsx::write_xlsx(&d.wb).unwrap()
+    };
+    let d = session.doc_mut().unwrap();
+    d.original_xlsx = Some(payload);
+    d.path = Some("mineral-title.xlsm".to_string());
+    let err = session
+        .execute("file.saveBytes", json!({"format": "xlsx"}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("NOT saved"), "{err}");
+}
+
+
+#[test]
+fn imported_xlsx_does_not_silently_drop_unmodelled_parts_on_full_rewrite() {
+    let mut session = s();
+    let package = {
+        let d = session.doc().unwrap();
+        gridcraft_xlsx::write_xlsx(&d.wb).unwrap()
+    };
+    let d = session.doc_mut().unwrap();
+    d.original_xlsx = Some(package);
+    d.path = Some("full-fidelity-title-template.xlsx".to_string());
+    session.execute("cell.set", json!({"cell": "A1", "input": "ORGrid"})).unwrap();
+    session.doc_mut().unwrap().xlsx_structural_dirty = true;
+    let err = session
+        .execute("file.save", json!({"path": "/tmp/gridcraft-xlsx-destructive-save-test.xlsx"}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("NOT saved"), "{err}");
+    assert!(err.contains("complete workbook rewrite"), "{err}");
+}
+
+#[test]
+fn imported_title_workbook_rejects_unpatchable_noncell_changes() {
+    let mut session = s();
+    let original_package = {
+        let doc = session.doc().unwrap();
+        gridcraft_xlsx::write_xlsx(&doc.wb).unwrap()
+    };
+    let doc = session.doc_mut().unwrap();
+    doc.original_xlsx = Some(original_package);
+    doc.path = Some("complex-title.xlsm".to_string());
+
+    // Changing workbook properties without a cell edit must not result in a
+    // successful save of the original bytes with the requested change missing.
+    let mut changed = (*doc.wb).clone();
+    changed.props.title = "Title ownership review".into();
+    doc.wb = std::sync::Arc::new(changed);
+
+    let err = session
+        .execute("file.save", json!({"path": "/tmp/gridcraft-unpatchable-noncell-guard.xlsm"}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("NOT saved"), "{err}");
+    assert!(err.contains("cell-only package patch"), "{err}");
+}
+
+#[test]
+fn macro_workbook_byte_export_keeps_original_package_for_noop() {
+    let mut session = s();
+    let original = {
+        let doc = session.doc().unwrap();
+        gridcraft_xlsx::write_xlsx(&doc.wb).unwrap()
+    };
+    {
+        let doc = session.doc_mut().unwrap();
+        doc.path = Some("title-review.xlsm".to_string());
+        doc.original_xlsx = Some(original.clone());
+    }
+    let result = session.execute("file.saveBytes", json!({"format": "xlsm"})).unwrap();
+    let encoded = result["base64"].as_str().unwrap();
+    let restored = crate::io::base64_decode(encoded).unwrap();
+    assert_eq!(restored, original, "untouched macro-enabled package must be returned unchanged");
+}
+
+#[test]
+fn excel_open_preserves_cached_formula_results_and_rebuilds_dependencies() {
+    let mut wb = gridcraft_model::Workbook::new();
+    let a1 = CellRef::parse("A1").unwrap();
+    let b1 = CellRef::parse("B1").unwrap();
+    let sh = wb.sheet_mut(0).unwrap();
+    sh.set_value(a1, Value::Number(2.0));
+    sh.set_cell(b1, gridcraft_model::Cell {
+        value: Value::Number(999.0),
+        formula: Some(std::sync::Arc::new(gridcraft_model::Formula::new("A1+1"))),
+        style: Default::default(),
+    });
+
+    let excel = crate::DocState::from_excel(wb.clone(), Some("title.xlsm".into()), "title.xlsm".into());
+    assert_eq!(excel.wb.active().unwrap().value(b1), Value::Number(999.0));
+    assert_eq!(excel.calc.graph.len(), 1, "dependency tracking must be rebuilt");
+
+    let fresh = crate::DocState::new(wb, None, "new book".into());
+    assert_eq!(fresh.wb.active().unwrap().value(b1), Value::Number(3.0));
+}
+
+#[test]
+fn undo_and_redo_restore_excel_structural_save_tracking() {
+    let mut session = s();
+    let original = {
+        let d = session.doc().unwrap();
+        gridcraft_xlsx::write_xlsx(&d.wb).unwrap()
+    };
+    {
+        let d = session.doc_mut().unwrap();
+        d.original_xlsx = Some(original);
+        d.path = Some("undo-structural.xlsx".into());
+    }
+
+    session.execute("home.insertRows", json!({"rows": "3:3"})).unwrap();
+    assert_eq!(session.doc().unwrap().xlsx_structural_edits.len(), 1);
+
+    session.execute("edit.undo", json!({})).unwrap();
+    assert!(session.doc().unwrap().xlsx_structural_edits.is_empty());
+    assert!(!session.doc().unwrap().xlsx_structural_dirty);
+    assert!(session.doc().unwrap().xlsx_dirty_cells.is_empty());
+
+    session.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(session.doc().unwrap().xlsx_structural_edits.len(), 1);
+}
+
+#[test]
+fn undo_and_redo_restore_exact_excel_style_copy_hints() {
+    let mut session = s();
+    session.execute("cell.set", json!({"cell": "A1", "input": "100"})).unwrap();
+    let original = {
+        let d = session.doc().unwrap();
+        gridcraft_xlsx::write_xlsx(&d.wb).unwrap()
+    };
+    {
+        let d = session.doc_mut().unwrap();
+        d.saved = d.wb.clone();
+        d.original_xlsx = Some(original);
+        d.path = Some("undo-copy.xlsm".into());
+        d.xlsx_dirty_cells.clear();
+    }
+    session.execute("edit.copy", json!({"range": "A1"})).unwrap();
+    session.execute("edit.paste", json!({"at": "B1"})).unwrap();
+    assert_eq!(session.doc().unwrap().xlsx_style_copies.len(), 1);
+
+    session.execute("edit.undo", json!({})).unwrap();
+    assert!(session.doc().unwrap().xlsx_style_copies.is_empty());
+    assert!(session.doc().unwrap().xlsx_dirty_cells.is_empty());
+
+    session.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(session.doc().unwrap().xlsx_style_copies.len(), 1);
+    assert_eq!(session.doc().unwrap().wb.active().unwrap().value(CellRef::parse("B1").unwrap()), Value::Number(100.0));
+}
+
+#[test]
+fn undo_after_save_rebases_xlsm_cell_edit_against_new_package() {
+    let mut session = s();
+    session.execute("cell.set", json!({"cell": "B2", "input": "before"})).unwrap();
+
+    let original = {
+        let d = session.doc().unwrap();
+        gridcraft_xlsx::write_xlsx(&d.wb).unwrap()
+    };
+    {
+        let d = session.doc_mut().unwrap();
+        d.saved = d.wb.clone();
+        d.original_xlsx = Some(original);
+        d.path = Some("undo-after-save.xlsm".into());
+        d.xlsx_dirty_cells.clear();
+    }
+    session.execute("cell.set", json!({"cell": "B2", "input": "after"})).unwrap();
+    let target = std::env::temp_dir().join(format!("orgrid-undo-after-save-{}.xlsm", std::process::id()));
+    let target_name = target.to_string_lossy().to_string();
+    session.execute("file.save", json!({"path": target_name})).unwrap();
+    assert_eq!(session.doc().unwrap().xlsx_epoch, 1);
+
+    session.execute("edit.undo", json!({})).unwrap();
+    assert!(session.doc().unwrap().xlsx_dirty_cells.contains(&(0, CellRef::parse("B2").unwrap())));
+    let exported = session.execute("file.saveBytes", json!({"format": "xlsm"})).unwrap();
+    let patched = crate::io::base64_decode(exported["base64"].as_str().unwrap()).unwrap();
+    let (reopened, _) = gridcraft_xlsx::read_xlsx(&patched).unwrap();
+    assert_eq!(reopened.sheet(0).unwrap().value(CellRef::parse("B2").unwrap()), Value::text("before"));
+
+    session.execute("edit.redo", json!({})).unwrap();
+    let exported = session.execute("file.saveBytes", json!({"format": "xlsm"})).unwrap();
+    let restored = crate::io::base64_decode(exported["base64"].as_str().unwrap()).unwrap();
+    let (reopened, _) = gridcraft_xlsx::read_xlsx(&restored).unwrap();
+    assert_eq!(reopened.sheet(0).unwrap().value(CellRef::parse("B2").unwrap()), Value::text("after"));
+    let _ = std::fs::remove_file(target);
+}
+
+#[test]
+fn undoing_structural_edit_after_save_refuses_unverified_package_rewrite() {
+    let mut session = s();
+    let original = {
+        let d = session.doc().unwrap();
+        gridcraft_xlsx::write_xlsx(&d.wb).unwrap()
+    };
+    {
+        let d = session.doc_mut().unwrap();
+        d.original_xlsx = Some(original);
+        d.path = Some("structural-undo.xlsm".into());
+    }
+    session.execute("home.insertRows", json!({"rows":"3:3"})).unwrap();
+    // Simulate a successful structural save establishing a new baseline.
+    {
+        let d = session.doc_mut().unwrap();
+        d.saved = d.wb.clone();
+        d.original_xlsx = Some(gridcraft_xlsx::write_xlsx(&d.wb).unwrap());
+        d.xlsx_structural_edits.clear();
+        d.xlsx_dirty_cells.clear();
+        d.xlsx_epoch = 1;
+    }
+    session.execute("edit.undo", json!({})).unwrap();
+    assert!(session.doc().unwrap().xlsx_structural_dirty);
+    let error = session.execute("file.saveBytes", json!({"format":"xlsm"})).unwrap_err().to_string();
+    assert!(error.contains("NOT saved"), "{error}");
+}
+
+
+#[test]
+fn imported_excel_edit_persists_recalculated_numeric_formula_results() {
+    use std::sync::Arc;
+    let mut original = gridcraft_model::Workbook::new();
+    let a1 = CellRef::parse("A1").unwrap();
+    let b1 = CellRef::parse("B1").unwrap();
+    original.sheet_mut(0).unwrap().set_value(a1, Value::Number(2.0));
+    original.sheet_mut(0).unwrap().set_cell(b1, gridcraft_model::Cell {
+        value: Value::Number(4.0),
+        formula: Some(Arc::new(gridcraft_model::Formula::new("A1*2"))),
+        style: Default::default(),
+    });
+    let bytes = gridcraft_xlsx::write_xlsx(&original).unwrap();
+    let mut session = s();
+    session.execute("file.open", json!({
+        "name": "mineral-title.xlsx",
+        "base64": crate::io::base64_encode(&bytes)
+    })).unwrap();
+    assert_eq!(v(&session, "B1"), Value::Number(4.0));
+
+    session.execute("cell.set", json!({"cell": "A1", "input": "5"})).unwrap();
+    assert_eq!(v(&session, "B1"), Value::Number(10.0));
+    assert!(session.doc().unwrap().xlsx_dirty_cells.contains(&(0, b1)));
+
+    let export = session.execute("file.saveBytes", json!({"format": "xlsx"})).unwrap();
+    let saved = crate::io::base64_decode(export["base64"].as_str().unwrap()).unwrap();
+    let (reopened, _) = gridcraft_xlsx::read_xlsx(&saved).unwrap();
+    assert_eq!(reopened.sheet(0).unwrap().value(a1), Value::Number(5.0));
+    assert_eq!(reopened.sheet(0).unwrap().value(b1), Value::Number(10.0));
+    assert_eq!(reopened.sheet(0).unwrap().cell(b1).unwrap().formula.as_ref().unwrap().text, "A1*2");
+}

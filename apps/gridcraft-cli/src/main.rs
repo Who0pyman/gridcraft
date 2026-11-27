@@ -270,10 +270,22 @@ fn convert(args: &[String]) -> Result<(), String> {
     }
     let mut s = open(input)?;
     activate_sheet(&mut s, a.opt("sheet"))?;
-    let d = s.doc().map_err(|e| e.to_string())?;
-    let bytes = gridcraft_engine::io::save_bytes(&d.wb, out).map_err(|e| e.to_string())?;
-    gridcraft_engine::io::write_file(out, &bytes).map_err(|e| e.to_string())?;
-    eprintln!("wrote {out} ({} bytes)", bytes.len());
+    // Reuse the package-preserving save path for Excel files. Directly invoking
+    // the full XLSX writer would silently discard VBA projects and unsupported
+    // workbook components from imported macro-enabled files.
+    let bytes = if matches!(
+        gridcraft_engine::io::FileKind::from_path(out),
+        Some(gridcraft_engine::io::FileKind::Xlsx)
+    ) {
+        let result = exec(&mut s, "file.save", json!({"path": out}))?;
+        result["bytes"].as_u64().ok_or("save did not return an output size")? as usize
+    } else {
+        let d = s.doc().map_err(|e| e.to_string())?;
+        let bytes = gridcraft_engine::io::save_bytes(&d.wb, out).map_err(|e| e.to_string())?;
+        gridcraft_engine::io::write_file(out, &bytes).map_err(|e| e.to_string())?;
+        bytes.len()
+    };
+    eprintln!("wrote {out} ({} bytes)", bytes);
     Ok(())
 }
 

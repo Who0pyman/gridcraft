@@ -231,6 +231,7 @@ pub struct Ctx<'a> {
     pub changed: Vec<Key>,
     pub structural: bool,
     pub xlsx_structural_edits: Vec<gridcraft_xlsx::StructuralEdit>,
+    pub xlsx_style_copies: Vec<(usize, CellRef, usize, CellRef)>,
     pub sel: &'a mut Selection,
     /// Rows whose automatic height should be recomputed (sheet, row).
     pub fit_rows: Vec<(usize, u32)>,
@@ -259,12 +260,13 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
         changed: Vec::new(),
         structural: false,
         xlsx_structural_edits: Vec::new(),
+        xlsx_style_copies: Vec::new(),
         sel: &mut sel,
         fit_rows: Vec::new(),
         protection_checked: false,
     };
     let r = f(&mut ctx)?;
-    let Ctx { mut wb, changed, structural, xlsx_structural_edits, mut fit_rows, protection_checked, .. } = ctx;
+    let Ctx { mut wb, changed, structural, xlsx_structural_edits, xlsx_style_copies, mut fit_rows, protection_checked, .. } = ctx;
     if !protection_checked {
         check_protection(&d.wb, &wb)?;
     }
@@ -295,6 +297,16 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
     // Excel package instead of rebuilding the entire workbook.
     if d.original_xlsx.is_some() {
         d.xlsx_dirty_cells.extend(changed.iter().cloned());
+        if !structural {
+            // Dependent formulas were recalculated in memory. Their supported
+            // cached results must also be saved, or reopening the XLSM would
+            // show stale WI/NRI percentages even though the edit was saved.
+            d.xlsx_dirty_cells.extend(d.calc.last_recalc_changed.iter().copied());
+        }
+        // A later edit of the same destination must invalidate any earlier
+        // copy hint before replacing it with the most recent one.
+        d.xlsx_style_copies.retain(|(_, _, si, dest)| !changed.contains(&(*si, *dest)));
+        d.xlsx_style_copies.extend(xlsx_style_copies);
         if structural {
             if xlsx_structural_edits.is_empty() {
                 d.xlsx_structural_dirty = true;

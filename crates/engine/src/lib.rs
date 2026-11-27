@@ -56,6 +56,15 @@ pub struct HistoryEntry {
     pub label: String,
     pub wb: Arc<Workbook>,
     pub selection: Selection,
+    /// Original-package edit tracking must move with the undo history.
+    pub xlsx_dirty_cells: Vec<gridcraft_calc::Key>,
+    pub xlsx_style_copies: Vec<(usize, CellRef, usize, CellRef)>,
+    pub xlsx_structural_edits: Vec<gridcraft_xlsx::StructuralEdit>,
+    pub xlsx_structural_dirty: bool,
+    /// Excel package snapshot generation. Saves create a new baseline for undo.
+    pub xlsx_epoch: u64,
+    /// The command represented by this history entry changed workbook structure.
+    pub structural_action: bool,
 }
 
 /// The clipboard: a block of cells (with formulas and styles) or marching-ants reference.
@@ -98,10 +107,19 @@ pub struct DocState {
     pub original_xlsx: Option<Vec<u8>>,
     /// Cells edited since the original XLSX package was loaded/saved.
     pub xlsx_dirty_cells: Vec<gridcraft_calc::Key>,
+    /// Exact original Excel cell styles to carry across same-workbook copy/fill.
+    /// Imported style records can differ in OOXML even when GridCraft's style
+    /// model considers them equal. (source sheet/cell, destination sheet/cell)
+    pub xlsx_style_copies: Vec<(usize, CellRef, usize, CellRef)>,
     /// Structural worksheet edits that can be patched into the original XLSX package.
     pub xlsx_structural_edits: Vec<gridcraft_xlsx::StructuralEdit>,
     /// True when an unsupported structural change requires the full XLSX writer.
     pub xlsx_structural_dirty: bool,
+    /// Changes when the original Excel package baseline is successfully saved.
+    pub xlsx_epoch: u64,
+    /// True only for byte-identical workbooks exported by this session's
+    /// GridCraft native writer; these can safely use that writer again.
+    pub native_xlsx: bool,
     /// Per-sheet selection memory.
     pub sheet_selections: Vec<Selection>,
 }
@@ -110,9 +128,25 @@ static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 const UNDO_LIMIT: usize = 100;
 
 impl DocState {
-    pub fn new(mut wb: Workbook, path: Option<String>, title: String) -> DocState {
+    pub fn new(wb: Workbook, path: Option<String>, title: String) -> DocState {
+        Self::build(wb, path, title, true)
+    }
+
+    /// Keep Excel's stored calculation results when first opening a workbook.
+    /// Rebuilding the dependency graph is still necessary so later edits recalculate
+    /// their dependents. Unlike a full recalculation, it does not replace caches
+    /// for circular formulas, external links, or functions requiring Excel.
+    pub fn from_excel(wb: Workbook, path: Option<String>, title: String) -> DocState {
+        Self::build(wb, path, title, false)
+    }
+
+    fn build(mut wb: Workbook, path: Option<String>, title: String, recalculate: bool) -> DocState {
         let mut calc = Calc::new();
-        calc.recalc_all(&mut wb);
+        if recalculate {
+            calc.recalc_all(&mut wb);
+        } else {
+            calc.rebuild(&wb);
+        }
         let wb = Arc::new(wb);
         let sel = Selection::at(wb.active().map(|s| s.view_active).unwrap_or_default());
         DocState {
@@ -128,8 +162,11 @@ impl DocState {
             title,
             original_xlsx: None,
             xlsx_dirty_cells: vec![],
+            xlsx_style_copies: vec![],
             xlsx_structural_edits: vec![],
             xlsx_structural_dirty: false,
+            xlsx_epoch: 0,
+            native_xlsx: false,
             sheet_selections: vec![],
         }
     }
@@ -212,6 +249,10 @@ pub struct Session {
     pub draw_tool: String,
     pub draw_color: String,
     pub draw_width: f32,
+    /// A bounded set of exact XLSX byte packages created by the native writer
+    /// during this session. Other imported workbooks must never use the full
+    /// writer, because it can lose VBA, external links and drawing metadata.
+    pub recent_native_xlsx_exports: Vec<Vec<u8>>,
 }
 
 impl Session {
@@ -276,7 +317,16 @@ impl Session {
         if let Err(why) = (spec.enabled)(self) {
             return Err(EngineError::Disabled(id.to_string(), why));
         }
-        let before = self.active().map(|d| (d.uid, d.wb.clone(), d.selection.clone()));
+        let before = self.active().map(|d| (
+            d.uid,
+            d.wb.clone(),
+            d.selection.clone(),
+            d.xlsx_dirty_cells.clone(),
+            d.xlsx_style_copies.clone(),
+            d.xlsx_structural_edits.clone(),
+            d.xlsx_structural_dirty,
+            d.xlsx_epoch,
+        ));
         let params = if params.is_null() { Json::Object(Default::default()) } else { params };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (spec.run)(self, &params)));
         let result = match result {
@@ -285,11 +335,16 @@ impl Session {
                 let msg =
                     p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".into());
                 // Restore the workbook as it was.
-                if let Some((uid, wb, sel)) = &before
+                if let Some((uid, wb, sel, dirty_cells, style_copies, structural_edits, structural_dirty, epoch)) = &before
                     && let Some(d) = self.docs.iter_mut().find(|d| d.uid == *uid)
                 {
                     d.wb = wb.clone();
                     d.selection = sel.clone();
+                    d.xlsx_dirty_cells = dirty_cells.clone();
+                    d.xlsx_style_copies = style_copies.clone();
+                    d.xlsx_structural_edits = structural_edits.clone();
+                    d.xlsx_structural_dirty = *structural_dirty;
+                    d.xlsx_epoch = *epoch;
                     d.calc.rebuild(&d.wb);
                 }
                 return Err(EngineError::Internal(id.to_string(), msg));
@@ -302,11 +357,23 @@ impl Session {
             }
         }
         if spec.undoable
-            && let Some((uid, wb, sel)) = before
+            && let Some((uid, wb, sel, dirty_cells, style_copies, structural_edits, structural_dirty, epoch)) = before
             && let Some(d) = self.docs.iter_mut().find(|d| d.uid == uid)
             && !Arc::ptr_eq(&d.wb, &wb)
         {
-            d.undo.push(HistoryEntry { label: spec.label.trim_end_matches('…').to_string(), wb, selection: sel });
+            let structural_action = d.xlsx_structural_dirty != structural_dirty
+                || d.xlsx_structural_edits.len() != structural_edits.len();
+            d.undo.push(HistoryEntry {
+                label: spec.label.trim_end_matches('…').to_string(),
+                wb,
+                selection: sel,
+                xlsx_dirty_cells: dirty_cells,
+                xlsx_style_copies: style_copies,
+                xlsx_structural_edits: structural_edits,
+                xlsx_structural_dirty: structural_dirty,
+                xlsx_epoch: epoch,
+                structural_action,
+            });
             if d.undo.len() > UNDO_LIMIT {
                 d.undo.remove(0);
             }

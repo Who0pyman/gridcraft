@@ -7,6 +7,8 @@ on:
     branches: [main, release]
     paths: [".github/workflows/**", "packaging/**", "assets/app-icon/**"]
   pull_request:
+    # ORGrid development PRs run their workbook checks only when explicitly requested.
+    branches-ignore: [orgrid-main]
     paths: [".github/workflows/**", "packaging/**", "assets/app-icon/**"]
   workflow_dispatch:
 

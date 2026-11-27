@@ -46,6 +46,7 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
         s.ui_requests.push(crate::UiRequest::Dialog("open".into(), json!({})));
         return ok();
     };
+    let native_xlsx = s.recent_native_xlsx_exports.iter().any(|export| export == &bytes);
     let (wb, warnings) = crate::io::open_bytes(&name, &bytes)?;
     let imported = matches!(crate::io::FileKind::from_path(&name), Some(crate::io::FileKind::Ods | crate::io::FileKind::Xlsb))
         || matches!(gridcraft_xlsx::sniff(&bytes), gridcraft_xlsx::Format::Ods | gridcraft_xlsx::Format::Xlsb);
@@ -62,7 +63,16 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
     {
         s.close_document(0);
     }
-    let mut doc = DocState::new(wb, path, title);
+    // Imported Excel workbooks already contain Excel-calculated caches.
+    // Don't replace those values with GridCraft's results just by opening the file.
+    let is_excel = !imported && matches!(crate::io::FileKind::from_path(&name), Some(crate::io::FileKind::Xlsx));
+    let mut doc = if is_excel {
+        DocState::from_excel(wb, path, title)
+    } else {
+        DocState::new(wb, path, title)
+    };
+
+    doc.native_xlsx = native_xlsx && is_excel && !macro_enabled_path(&name);
 
     // ORGrid: retain the original XLSX package so an untouched workbook
     // can be saved without destroying unsupported Excel package parts.
@@ -84,6 +94,84 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
     )
 }
 
+/// Macro-enabled Excel packages must never pass through GridCraft's full XLSX writer:
+/// that writer does not serialize VBA projects or external workbook relationships.
+fn macro_enabled_path(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("xlsm") || ext.eq_ignore_ascii_case("xltm"))
+}
+
+fn macro_preservation_error(reason: &str) -> EngineError {
+    EngineError::Other(format!(
+        "The macro-enabled workbook was NOT saved. {reason} GridCraft cannot safely rewrite the VBA and external-link parts of this file. Use Excel for this operation; your original file is unchanged."
+    ))
+}
+
+fn xlsx_preservation_error(reason: &str) -> EngineError {
+    EngineError::Other(format!(
+        "The imported Excel workbook was NOT saved. {reason} GridCraft cannot safely rebuild every original workbook component. The original file is unchanged."
+    ))
+}
+
+/// Package patching writes cell content and styles, not every workbook feature.
+/// If the in-memory model has other edits, returning success would silently lose
+/// those edits while claiming the file was saved. Fail rather than discard them.
+pub(crate) fn unsupported_cell_patch_change(before: &gridcraft_model::Workbook, after: &gridcraft_model::Workbook) -> Option<String> {
+    if before.sheets.len() != after.sheets.len() {
+        return Some("worksheet count changed".into());
+    }
+    if before.names != after.names {
+        return Some("defined names changed".into());
+    }
+    if before.theme != after.theme || before.date_system != after.date_system || before.calc != after.calc {
+        return Some("workbook theme or calculation settings changed".into());
+    }
+    if before.props != after.props
+        || before.protected_structure != after.protected_structure
+        || before.custom_lists != after.custom_lists
+        || before.cell_styles != after.cell_styles
+    {
+        return Some("workbook properties or named styles changed".into());
+    }
+    for (previous, current) in before.sheets.iter().zip(&after.sheets) {
+        if previous.name != current.name
+            // Safe XLSX patching now writes row heights, hidden rows and outlines.
+            || previous.cols != current.cols
+            || previous.default_col_width != current.default_col_width
+            || previous.default_row_height != current.default_row_height
+            // The OOXML save path now patches mergeCells independently.
+            || previous.freeze != current.freeze
+            || previous.tab_color != current.tab_color
+            || previous.visibility != current.visibility
+            || previous.show_gridlines != current.show_gridlines
+            || previous.show_headings != current.show_headings
+            || previous.show_formulas != current.show_formulas
+            || previous.show_zeros != current.show_zeros
+            || previous.right_to_left != current.right_to_left
+            || previous.zoom != current.zoom
+            || previous.cond_formats != current.cond_formats
+            || previous.validations != current.validations
+            || previous.tables != current.tables
+            || previous.autofilter != current.autofilter
+            || previous.cell_pictures != current.cell_pictures
+            || previous.comments != current.comments
+            || previous.hyperlinks != current.hyperlinks
+            || previous.charts != current.charts
+            || previous.images != current.images
+            || previous.shapes != current.shapes
+            || previous.sparklines != current.sparklines
+            || previous.pivots != current.pivots
+            || previous.protection != current.protection
+            || previous.print != current.print
+        {
+            return Some(format!("unpatchable worksheet features changed on {}", previous.name));
+        }
+    }
+    None
+}
+
 fn save(s: &mut Session, p: &Json) -> Result<Json> {
     let path = match str_param(p, "path").map(str::to_string).or_else(|| s.active().and_then(|d| d.path.clone())) {
         Some(p) => p,
@@ -94,19 +182,68 @@ fn save(s: &mut Session, p: &Json) -> Result<Json> {
     };
     let d = s.doc_mut()?;
     let kind = crate::io::FileKind::from_path(&path).unwrap_or(crate::io::FileKind::Xlsx);
+    let source_name = d.path.as_deref().unwrap_or(&d.title);
+    let macro_workbook = d.original_xlsx.is_some() && macro_enabled_path(source_name);
 
-    let bytes = if matches!(kind, crate::io::FileKind::Xlsx) {
+    if matches!(kind, crate::io::FileKind::Xlsx) {
+        if d.original_xlsx.is_some() && macro_enabled_path(source_name) != macro_enabled_path(&path) {
+            return Err(macro_preservation_error(
+                "Changing between macro-enabled and macro-free workbook formats would invalidate the original Excel package.",
+            ));
+        }
+        if d.original_xlsx.is_none() && macro_enabled_path(&path) {
+            return Err(macro_preservation_error(
+                "Creating a new macro-enabled workbook without an original Excel package is unsupported.",
+            ));
+        }
+    }
+
+    let bytes = if matches!(kind, crate::io::FileKind::Xlsx) && d.native_xlsx && !macro_workbook {
+        // This is an exact byte-matched native GridCraft export. No foreign
+        // Excel OOXML parts exist, so structural and drawing edits can use
+        // the complete writer just as they did before package preservation.
+        crate::io::save_bytes(&d.wb, &path)?
+    } else if matches!(kind, crate::io::FileKind::Xlsx) {
         match &d.original_xlsx {
             Some(original) if !d.is_dirty() => original.clone(),
             Some(original) if !d.xlsx_structural_dirty && d.xlsx_structural_edits.is_empty() => {
-                gridcraft_xlsx::patch_xlsx(original, &d.saved, &d.wb, &d.xlsx_dirty_cells)
+                if let Some(change) = unsupported_cell_patch_change(&d.saved, &d.wb) {
+                    return Err(xlsx_preservation_error(&format!(
+                        "This edit cannot be represented by a cell-only package patch ({change})."
+                    )));
+                }
+                gridcraft_xlsx::patch_xlsx_with_style_copies(original, &d.saved, &d.wb, &d.xlsx_dirty_cells, &d.xlsx_style_copies)
                     .map_err(|e| EngineError::Other(format!("Safe XLSX patch save failed: {e}")))?
             }
             Some(original) if !d.xlsx_structural_dirty => {
+                if !d.xlsx_style_copies.is_empty() {
+                    return Err(xlsx_preservation_error(
+                        "Combining structural row/column edits with exact Excel format-copy hints is not yet package-safe.",
+                    ));
+                }
                 match gridcraft_xlsx::patch_xlsx_structural(original, &d.saved, &d.wb, &d.xlsx_dirty_cells, &d.xlsx_structural_edits) {
                     Ok(bytes) => bytes,
-                    Err(_) => crate::io::save_bytes(&d.wb, &path)?,
+                    Err(error) if macro_workbook => {
+                        return Err(macro_preservation_error(&format!(
+                            "The structural XLSX patch could not preserve this edit ({error})."
+                        )));
+                    }
+                    Err(error) => {
+                        return Err(xlsx_preservation_error(&format!(
+                            "The structural package-preserving patch failed ({error})."
+                        )));
+                    }
                 }
+            }
+            Some(_) if macro_workbook => {
+                return Err(macro_preservation_error(
+                    "This edit requires a complete workbook rewrite, which would discard unsupported Excel components.",
+                ));
+            }
+            Some(_) => {
+                return Err(xlsx_preservation_error(
+                    "This edit requires a complete workbook rewrite.",
+                ));
             }
             _ => crate::io::save_bytes(&d.wb, &path)?,
         }
@@ -124,12 +261,15 @@ fn save(s: &mut Session, p: &Json) -> Result<Json> {
         if matches!(kind, crate::io::FileKind::Xlsx) {
             d.original_xlsx = Some(bytes.clone());
             d.xlsx_dirty_cells.clear();
+            d.xlsx_style_copies.clear();
             d.xlsx_structural_edits.clear();
             d.xlsx_structural_dirty = false;
+            d.xlsx_epoch = d.xlsx_epoch.wrapping_add(1);
         } else {
             // A JSON save no longer has an XLSX package that corresponds to `saved`.
             d.original_xlsx = None;
             d.xlsx_dirty_cells.clear();
+            d.xlsx_style_copies.clear();
             d.xlsx_structural_edits.clear();
             d.xlsx_structural_dirty = false;
         }
@@ -148,8 +288,63 @@ fn save_as(s: &mut Session, p: &Json) -> Result<Json> {
 fn save_bytes(s: &mut Session, p: &Json) -> Result<Json> {
     let fmt = str_param(p, "format").unwrap_or("xlsx");
     let d = s.doc()?;
-    let bytes = crate::io::save_bytes(&d.wb, &format!("x.{fmt}"))?;
+    let out = format!("x.{fmt}");
+    let kind = crate::io::FileKind::from_path(&out).unwrap_or(crate::io::FileKind::Xlsx);
+    let bytes = if matches!(kind, crate::io::FileKind::Xlsx) && d.native_xlsx {
+        crate::io::save_bytes(&d.wb, &out)?
+    } else if matches!(kind, crate::io::FileKind::Xlsx) {
+        let source_name = d.path.as_deref().unwrap_or(&d.title);
+        if d.original_xlsx.is_some() && macro_enabled_path(source_name) != macro_enabled_path(&out) {
+            return Err(macro_preservation_error(
+                "Changing between macro-enabled and macro-free workbook formats would invalidate the original Excel package.",
+            ));
+        }
+        match &d.original_xlsx {
+            Some(original) if !d.is_dirty() => original.clone(),
+            Some(original) if !d.xlsx_structural_dirty && d.xlsx_structural_edits.is_empty() => {
+                if let Some(change) = unsupported_cell_patch_change(&d.saved, &d.wb) {
+                    return Err(xlsx_preservation_error(&format!(
+                        "This edit cannot be represented by a cell-only package patch ({change})."
+                    )));
+                }
+                gridcraft_xlsx::patch_xlsx_with_style_copies(original, &d.saved, &d.wb, &d.xlsx_dirty_cells, &d.xlsx_style_copies)
+                    .map_err(|e| xlsx_preservation_error(&format!("Safe XLSX patch failed ({e}).")))?
+            }
+            Some(original) if !d.xlsx_structural_dirty => {
+                if !d.xlsx_style_copies.is_empty() {
+                    return Err(xlsx_preservation_error(
+                        "Combining structural edits with exact Excel format-copy hints is not yet package-safe.",
+                    ));
+                }
+                gridcraft_xlsx::patch_xlsx_structural(original, &d.saved, &d.wb, &d.xlsx_dirty_cells, &d.xlsx_structural_edits)
+                    .map_err(|e| xlsx_preservation_error(&format!("Safe structural XLSX patch failed ({e}).")))?
+            }
+            Some(_) => {
+                return Err(xlsx_preservation_error(
+                    "This edit requires an unsafe full workbook rewrite.",
+                ));
+            }
+            None if macro_enabled_path(&out) => {
+                return Err(macro_preservation_error(
+                    "Creating a macro-enabled workbook without an original Excel package is unsupported.",
+                ));
+            }
+            None => crate::io::save_bytes(&d.wb, &out)?,
+        }
+    } else {
+        crate::io::save_bytes(&d.wb, &out)?
+    };
     let name = format!("{}.{fmt}", std::path::Path::new(&d.display_title()).file_stem().and_then(|x| x.to_str()).unwrap_or("Book"));
+    let is_new_native_export = matches!(kind, crate::io::FileKind::Xlsx)
+        && (d.original_xlsx.is_none() || d.native_xlsx)
+        && !macro_enabled_path(&out);
+    if is_new_native_export && bytes.len() <= 20 * 1024 * 1024 {
+        s.recent_native_xlsx_exports.push(bytes.clone());
+        // Do not retain large or unbounded XLSX data in session history.
+        if s.recent_native_xlsx_exports.len() > 4 {
+            s.recent_native_xlsx_exports.remove(0);
+        }
+    }
     Ok(json!({"name": name, "base64": crate::io::base64_encode(&bytes), "bytes": bytes.len()}))
 }
 

@@ -1299,8 +1299,353 @@ pub fn patch_xlsx_structural(
     if dirty.is_empty() { Ok(structurally_shifted) } else { patch_xlsx(&structurally_shifted, &shifted_base, wb, &dirty) }
 }
 
+/// Convert an edited shared-formula group into standalone formulas before
+/// replacing one of its cells. Otherwise deleting the master leaves dangling
+/// shared-formula children. Preserve each original cached value and cell style.
+fn expand_edited_shared_formula_groups(
+    source: &str,
+    base: &gridcraft_model::Sheet,
+    after: &gridcraft_model::Sheet,
+    dirty: &BTreeSet<CellRef>,
+) -> Result<String, IoError> {
+    let mut group_ids = BTreeSet::<String>::new();
+
+    for &address in dirty {
+        let before = base.cell(address).and_then(|c| c.formula.as_ref());
+        let after = after.cell(address).and_then(|c| c.formula.as_ref());
+        if before == after {
+            continue;
+        }
+        let Some((start, end, _)) = find_cell_span(source, &address.a1()) else {
+            continue;
+        };
+        let cell = &source[start..end];
+        let Some(f_start) = cell.find("<f") else { continue };
+        let f_end = f_start + cell[f_start..]
+            .find('>')
+            .ok_or_else(|| IoError::Xml("shared formula start tag is unterminated".into()))?;
+        let f_tag = &cell[f_start..=f_end];
+        if attr_value(f_tag, "t").as_deref() == Some("shared") {
+            let si = attr_value(f_tag, "si")
+                .ok_or_else(|| IoError::Format("shared formula group has no si attribute".into()))?;
+            group_ids.insert(si);
+        }
+    }
+
+    if group_ids.is_empty() {
+        return Ok(source.to_string());
+    }
+
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(rel) = source[cursor..].find("<c") {
+        let cell_start = cursor + rel;
+        let next = source.as_bytes().get(cell_start + 2).copied();
+        if !matches!(next, Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') | Some(b'>') | Some(b'/')) {
+            cursor = cell_start + 2;
+            continue;
+        }
+        let tag_end = cell_start + source[cell_start..]
+            .find('>')
+            .ok_or_else(|| IoError::Xml("worksheet cell tag is unterminated".into()))?;
+        let cell_tag = &source[cell_start..=tag_end];
+        if cell_tag.trim_end().ends_with("/>") {
+            cursor = tag_end + 1;
+            continue;
+        }
+        let cell_end = tag_end + 1 + source[tag_end + 1..]
+            .find("</c>")
+            .ok_or_else(|| IoError::Xml("worksheet cell has no closing tag".into()))? + 4;
+        cursor = cell_end;
+        let cell_xml = &source[cell_start..cell_end];
+
+        let Some(relative_f_start) = cell_xml.find("<f") else { continue };
+        let f_start = cell_start + relative_f_start;
+        let f_tag_end = f_start + source[f_start..]
+            .find('>')
+            .ok_or_else(|| IoError::Xml("formula tag is unterminated".into()))?;
+        let f_tag = &source[f_start..=f_tag_end];
+        if attr_value(f_tag, "t").as_deref() != Some("shared") {
+            continue;
+        }
+        let si = attr_value(f_tag, "si")
+            .ok_or_else(|| IoError::Format("shared formula group has no si attribute".into()))?;
+        if !group_ids.contains(&si) {
+            continue;
+        }
+
+        let address = attr_value(cell_tag, "r")
+            .and_then(|s| CellRef::parse(&s))
+            .ok_or_else(|| IoError::Format("shared formula has no valid cell address".into()))?;
+        let formula = base.cell(address).and_then(|c| c.formula.as_ref())
+            .ok_or_else(|| IoError::Format(format!("shared formula missing in model at {}!{}", base.name, address.a1())))?;
+
+        let f_end = if f_tag.trim_end().ends_with("/>") {
+            f_tag_end + 1
+        } else {
+            f_tag_end + 1 + source[f_tag_end + 1..cell_end]
+                .find("</f>")
+                .ok_or_else(|| IoError::Xml("shared formula has no closing tag".into()))? + 4
+        };
+        replacements.push((f_start, f_end, format!("<f>{}</f>", xml::esc(&crate::fmla::to_file(formula)))));
+    }
+
+    let mut result = source.to_string();
+    for (start, end, replacement) in replacements.into_iter().rev() {
+        result.replace_range(start..end, &replacement);
+    }
+    Ok(result)
+}
+
+/// Preserve explicit row heights, hidden rows and outline metadata changed by
+/// auto-fit, copy or row formatting. Cell edits otherwise create plain <row r>
+/// elements and silently discard the model's new row height.
+fn patch_row_metadata(
+    source: &str,
+    before: &gridcraft_model::Sheet,
+    after: &gridcraft_model::Sheet,
+) -> Result<String, IoError> {
+    if before.rows == after.rows {
+        return Ok(source.to_string());
+    }
+    let changed: BTreeSet<u32> = before.rows.keys().chain(after.rows.keys()).copied()
+        .filter(|r| before.rows.get(r) != after.rows.get(r)).collect();
+    let mut result = source.to_string();
+    for row in changed {
+        let old_info = before.rows.get(&row);
+        let new_info = after.rows.get(&row);
+        if old_info.and_then(|r| r.style) != new_info.and_then(|r| r.style) {
+            return Err(IoError::Format(format!(
+                "safe worksheet row patch does not yet support changing the row's base style at row {}", row + 1
+            )));
+        }
+        let row_number = row.saturating_add(1);
+        let data_start = result.find("<sheetData")
+            .ok_or_else(|| IoError::Xml("worksheet has no sheetData element".into()))?;
+        let data_tag_end = data_start + result[data_start..].find('>')
+            .ok_or_else(|| IoError::Xml("unterminated sheetData tag".into()))? + 1;
+        let self_closing_data = result[data_start..data_tag_end].trim_end().ends_with("/>");
+        let data_end = if self_closing_data {
+            data_tag_end
+        } else {
+            data_tag_end + result[data_tag_end..].find("</sheetData>")
+                .ok_or_else(|| IoError::Xml("sheetData has no closing tag".into()))?
+        };
+
+        let mut position = data_tag_end;
+        let mut existing = None;
+        if !self_closing_data {
+            while position < data_end {
+                let Some(relative) = result[position..data_end].find("<row") else {
+                    position = data_end;
+                    break;
+                };
+                let row_start = position + relative;
+                let next = result.as_bytes().get(row_start + 4).copied();
+                if !matches!(next, Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') | Some(b'>') | Some(b'/')) {
+                    position = row_start + 4;
+                    continue;
+                }
+                let row_end = row_start + result[row_start..].find('>')
+                    .ok_or_else(|| IoError::Xml("unterminated row tag".into()))? + 1;
+                let xml_row = attr_value(&result[row_start..row_end], "r")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .ok_or_else(|| IoError::Format("worksheet row has no valid number".into()))?;
+                if xml_row == row_number {
+                    existing = Some((row_start, row_end));
+                    position = row_start;
+                    break;
+                }
+                if xml_row > row_number {
+                    position = row_start;
+                    break;
+                }
+                position = row_end;
+            }
+        }
+
+        let mut tag = if let Some((start, end)) = existing {
+            result[start..end].to_string()
+        } else {
+            format!("<row r=\"{row_number}\"/>")
+        };
+        for attr in ["ht", "customHeight", "hidden", "outlineLevel", "collapsed"] {
+            tag = remove_attr(&tag, attr);
+        }
+        if let Some(info) = new_info {
+            if let Some(height) = info.size {
+                tag = set_tag_attr(&tag, "ht", &height.to_string())?;
+                tag = set_tag_attr(&tag, "customHeight", "1")?;
+            }
+            if info.hidden {
+                tag = set_tag_attr(&tag, "hidden", "1")?;
+            }
+            if info.outline > 0 {
+                tag = set_tag_attr(&tag, "outlineLevel", &info.outline.to_string())?;
+            }
+            if info.collapsed {
+                tag = set_tag_attr(&tag, "collapsed", "1")?;
+            }
+        }
+        if let Some((start, end)) = existing {
+            result.replace_range(start..end, &tag);
+        } else if new_info.is_some() {
+            if self_closing_data {
+                let expanded = format!("<sheetData>{tag}</sheetData>");
+                result.replace_range(data_start..data_tag_end, &expanded);
+            } else {
+                result.insert_str(position, &tag);
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Update only a numeric formula's Excel cached <v> result. Do not touch the
+/// <f> element: it may be a shared formula, array formula or have attributes
+/// that the full GridCraft formula writer cannot safely regenerate.
+fn patch_numeric_formula_cache(xml_cell: &str, result: f64) -> Result<String, IoError> {
+    if !result.is_finite() {
+        return Err(IoError::Format("cannot cache a non-finite Excel formula result".into()));
+    }
+    let cache = format!("<v>{}</v>", xml::num(result));
+    let mut out = xml_cell.to_string();
+    if let Some(start) = xml_cell.find("<v") {
+        let tag_end = start + xml_cell[start..]
+            .find('>')
+            .ok_or_else(|| IoError::Xml("formula cache <v> tag is unterminated".into()))? + 1;
+        let end = if xml_cell[start..tag_end].trim_end().ends_with("/>") {
+            tag_end
+        } else {
+            tag_end + xml_cell[tag_end..].find("</v>")
+                .ok_or_else(|| IoError::Xml("formula cache has no closing </v>".into()))? + "</v>".len()
+        };
+        out.replace_range(start..end, &cache);
+    } else {
+        let insertion = xml_cell.rfind("</c>")
+            .ok_or_else(|| IoError::Format("formula cache cannot be added to a self-closing cell".into()))?;
+        out.insert_str(insertion, &cache);
+    }
+    Ok(out)
+}
+
+/// Patch the sheet's merge list without rebuilding any unrelated OOXML parts.
+/// Excel stores these ranges outside sheetData, so a cell-only patch used to
+/// silently discard copied or newly merged areas.
+fn patch_merged_ranges(
+    source: &str,
+    before: &[gridcraft_core::RangeRef],
+    after: &[gridcraft_core::RangeRef],
+) -> Result<String, IoError> {
+    if before == after {
+        return Ok(source.to_string());
+    }
+    let mut unique = BTreeSet::new();
+    for range in after {
+        if !unique.insert(range.a1()) {
+            return Err(IoError::Format(format!("duplicate merged range {}", range.a1())));
+        }
+    }
+    for (i, a) in after.iter().enumerate() {
+        for b in after.iter().skip(i + 1) {
+            if a.intersects(b) {
+                return Err(IoError::Format(format!("overlapping merged ranges {} and {}", a.a1(), b.a1())));
+            }
+        }
+    }
+
+    let before_refs: BTreeSet<String> = before.iter().map(|r| r.a1()).collect();
+    let mut original_refs = BTreeSet::new();
+    let mut location = None;
+    if let Some(start) = source.find("<mergeCells") {
+        let start_end = start + source[start..]
+            .find('>')
+            .ok_or_else(|| IoError::Xml("unterminated mergeCells start tag".into()))? + 1;
+        let end = if source[start..start_end].trim_end().ends_with("/>") {
+            start_end
+        } else {
+            start_end + source[start_end..]
+                .find("</mergeCells>")
+                .ok_or_else(|| IoError::Xml("unterminated mergeCells element".into()))? + "</mergeCells>".len()
+        };
+
+        let merge_segment = &source[start..end];
+        let mut cursor = 0usize;
+        while let Some(relative) = merge_segment[cursor..].find("<mergeCell") {
+            let tag_start = cursor + relative;
+            let next = merge_segment.as_bytes().get(tag_start + "<mergeCell".len()).copied();
+            if !matches!(next, Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') | Some(b'/') | Some(b'>')) {
+                cursor = tag_start + "<mergeCell".len();
+                continue;
+            }
+            let tag_end = tag_start + merge_segment[tag_start..]
+                .find('>')
+                .ok_or_else(|| IoError::Xml("unterminated mergeCell tag".into()))? + 1;
+            let tag = &merge_segment[tag_start..tag_end];
+            let reference = attr_value(tag, "ref")
+                .ok_or_else(|| IoError::Format("mergeCell has no ref".into()))?;
+            let range = gridcraft_core::RangeRef::parse(&reference)
+                .ok_or_else(|| IoError::Format(format!("invalid mergeCell ref {reference}")))?;
+            original_refs.insert(range.a1());
+            cursor = tag_end;
+        }
+        location = Some((start, end));
+    }
+    if original_refs != before_refs {
+        return Err(IoError::Format(
+            "original merged ranges do not match the imported workbook; refusing lossy merge rewrite".into(),
+        ));
+    }
+
+    let mut replacement = format!("<mergeCells count=\"{}\">", after.len());
+    for range in after {
+        replacement.push_str(&format!("<mergeCell ref=\"{}\"/>", xml::esc_attr(&range.a1())));
+    }
+    replacement.push_str("</mergeCells>");
+
+    let mut result = source.to_string();
+    if let Some((start, end)) = location {
+        result.replace_range(start..end, &replacement);
+    } else {
+        // OOXML places mergeCells after sortState/customSheetViews, and
+        // before conditionalFormatting/dataValidations/pageMargins/drawings.
+        // Insert at the first following element with known later schema order.
+        let after_data = source.find("</sheetData>").map(|p| p + "</sheetData>".len())
+            .or_else(|| source.find("<sheetData").and_then(|p| source[p..].find('>').map(|end| p + end + 1)))
+            .ok_or_else(|| IoError::Xml("worksheet has no sheetData element".into()))?;
+        let after_tags = [
+            "<conditionalFormatting", "<dataValidations", "<hyperlinks",
+            "<printOptions", "<pageMargins", "<pageSetup", "<headerFooter",
+            "<rowBreaks", "<colBreaks", "<customProperties", "<cellWatches",
+            "<ignoredErrors", "<smartTags", "<drawing", "<legacyDrawing",
+            "<picture", "<oleObjects", "<controls", "<webPublishItems",
+            "<tableParts", "<extLst", "</worksheet>",
+        ];
+        let insert_at = after_tags.iter().filter_map(|tag| {
+            source[after_data..].find(tag).map(|p| after_data + p)
+        }).min().ok_or_else(|| IoError::Xml("worksheet is missing a closing element".into()))?;
+        result.insert_str(insert_at, &replacement);
+    }
+    Ok(result)
+}
+
 pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: &[(usize, CellRef)]) -> Result<Vec<u8>, IoError> {
-    if dirty_cells.is_empty() {
+    patch_xlsx_with_style_copies(original, base, wb, dirty_cells, &[])
+}
+
+/// Same as patch_xlsx, plus original-source OOXML style hints for copy/fill.
+/// Multiple original XF records may normalize to the same model StyleId. A
+/// copied cell must keep its *exact* source XF, not an arbitrary equivalent.
+pub fn patch_xlsx_with_style_copies(
+    original: &[u8],
+    base: &Workbook,
+    wb: &Workbook,
+    dirty_cells: &[(usize, CellRef)],
+    style_copies: &[(usize, CellRef, usize, CellRef)],
+) -> Result<Vec<u8>, IoError> {
+    if dirty_cells.is_empty()
+        && base.sheets.iter().zip(&wb.sheets).all(|(a, b)| a.merges == b.merges && a.rows == b.rows)
+    {
         return Ok(original.to_vec());
     }
 
@@ -1328,6 +1673,53 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
         }
     }
 
+    // Read the original s="..." XF indices once per source worksheet. This
+    // avoids applying a normalized but visually different style on paste.
+    let mut wanted: BTreeMap<usize, BTreeSet<CellRef>> = BTreeMap::new();
+    for &(src_sheet, src_cell, _, _) in style_copies {
+        wanted.entry(src_sheet).or_default().insert(src_cell);
+    }
+    let mut source_xfs: HashMap<(usize, CellRef), u32> = HashMap::new();
+    for (src_sheet, refs) in wanted {
+        let Some(part) = sheet_parts.get(src_sheet) else { continue };
+        let Some(bytes) = pkg.read(part)? else { continue };
+        let xml_text = std::str::from_utf8(&bytes)
+            .map_err(|_| IoError::Xml(format!("{part} is not UTF-8 XML")))?;
+        let bytes = xml_text.as_bytes();
+        let mut pos = 0usize;
+        while let Some(relative) = xml_text[pos..].find("<c") {
+            let start = pos + relative;
+            let next = bytes.get(start + 2).copied();
+            if !matches!(next, Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') | Some(b'>') | Some(b'/')) {
+                pos = start + 2;
+                continue;
+            }
+            let end = start + xml_text[start..].find('>')
+                .ok_or_else(|| IoError::Xml("worksheet cell start tag is unterminated".into()))? + 1;
+            let tag = &xml_text[start..end];
+            if let Some(cell) = attr_value(tag, "r").and_then(|r| CellRef::parse(&r))
+                && refs.contains(&cell)
+            {
+                let xf = attr_value(tag, "s").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+                source_xfs.insert((src_sheet, cell), xf);
+                if source_xfs.len() >= style_copies.len() {
+                    break;
+                }
+            }
+            pos = end;
+        }
+    }
+    let mut exact_styles: HashMap<(usize, CellRef), u32> = HashMap::new();
+    for &(src_sheet, src_cell, dst_sheet, dst_cell) in style_copies {
+        let source_style = base.sheet(src_sheet).and_then(|s| s.cell(src_cell)).map(|c| c.style);
+        let target_style = wb.sheet(dst_sheet).and_then(|s| s.cell(dst_cell)).map(|c| c.style);
+        if source_style.is_some() && source_style == target_style {
+            if let Some(&xf) = source_xfs.get(&(src_sheet, src_cell)) {
+                exact_styles.insert((dst_sheet, dst_cell), xf);
+            }
+        }
+    }
+
     let sst_part = wb_rels.iter().find(|r| r.kind == "sharedStrings").map(|r| r.target.clone());
 
     let mut sst = PatchSst::load(&mut pkg, sst_part)?;
@@ -1338,6 +1730,13 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
     let mut dirty_by_sheet: BTreeMap<usize, BTreeSet<CellRef>> = BTreeMap::new();
     for &(sheet_index, cell_ref) in dirty_cells {
         dirty_by_sheet.entry(sheet_index).or_default().insert(cell_ref);
+    }
+    for sheet_index in 0..base.sheets.len().min(wb.sheets.len()) {
+        if base.sheet(sheet_index).map(|s| (&s.merges, &s.rows))
+            != wb.sheet(sheet_index).map(|s| (&s.merges, &s.rows))
+        {
+            dirty_by_sheet.entry(sheet_index).or_default();
+        }
     }
 
     let mut replacements: HashMap<String, Vec<u8>> = HashMap::new();
@@ -1355,7 +1754,8 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
 
         let bytes = pkg.read(part)?.ok_or_else(|| IoError::Format(format!("missing worksheet part {part}")))?;
 
-        let mut text = String::from_utf8(bytes).map_err(|_| IoError::Xml(format!("{part} is not UTF-8 XML")))?;
+        let text = String::from_utf8(bytes).map_err(|_| IoError::Xml(format!("{part} is not UTF-8 XML")))?;
+        let mut text = expand_edited_shared_formula_groups(&text, base_sheet, sheet, &refs)?;
 
         struct Edit {
             start: usize,
@@ -1365,12 +1765,18 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
 
         let mut edits = Vec::new();
         let mut new_cells = Vec::new();
+        let removed_rows: BTreeSet<u32> = refs.iter()
+            .filter(|cell| sheet.cell(**cell).is_none())
+            .map(|cell| cell.row)
+            .collect();
 
         for cell_ref in refs {
             let old_style = base_sheet.style_id(cell_ref);
             let new_style = sheet.style_id(cell_ref);
 
-            let style_index = if old_style != new_style {
+            let style_index = if let Some(&exact_xf) = exact_styles.get(&(sheet_index, cell_ref)) {
+                Some(exact_xf)
+            } else if old_style != new_style {
                 if new_style.0 == 0 {
                     Some(0)
                 } else {
@@ -1391,16 +1797,35 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
 
             let old_formula = old_cell.and_then(|c| c.formula.as_ref());
             let new_formula = new_cell.and_then(|c| c.formula.as_ref());
+            let cache_number = match (old_cell, new_cell) {
+                (Some(before), Some(after))
+                    if before.value != after.value => match &after.value {
+                        Value::Number(number) if number.is_finite() => Some(*number),
+                        _ => None,
+                    },
+                _ => None,
+            };
 
-            // A dependent formula may have received a new cached result after recalculation.
-            // Preserve an unchanged formula cell exactly; Excel can recalculate it.
-            if old_formula.is_some() && old_formula == new_formula && style_index.is_none() {
+            // Preserve formula XML exactly unless its numeric cache changed or
+            // the cell style itself was edited. Invalid/external calc errors must
+            // never overwrite the original Excel cache.
+            if old_formula.is_some()
+                && old_formula == new_formula
+                && style_index.is_none()
+                && cache_number.is_none()
+            {
                 continue;
             }
 
             let a1 = cell_ref.a1();
 
             let Some((start, end, start_tag_end)) = find_cell_span(&text, &a1) else {
+                // A cell absent in both the destination model and original XML
+                // must stay absent. Creating a synthetic blank here changes the
+                // worksheet's used range after an undo.
+                if new_cell.is_none() {
+                    continue;
+                }
                 if old_formula.is_some() {
                     return Err(IoError::Format(format!(
                         "safe XLSX patching found a modeled formula with no original cell at {}!{}",
@@ -1441,6 +1866,41 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
             };
 
             let original_cell = &text[start..end];
+
+            if old_formula.is_some() && old_formula == new_formula {
+                let mut replacement = original_cell.to_string();
+                if let Some(number) = cache_number {
+                    // Numeric formula values (including shared-formula children)
+                    // can be patched without altering the formula structure.
+                    if matches!(attr_value(&text[start..start_tag_end], "t").as_deref(), None | Some("n")) {
+                        replacement = patch_numeric_formula_cache(&replacement, number)?;
+                    }
+                }
+                if let Some(style_index) = style_index {
+                    replacement = set_cell_style(&replacement, style_index)?;
+                }
+                if replacement != original_cell {
+                    edits.push(Edit { start, end, replacement });
+                }
+                continue;
+            }
+
+            if new_cell.is_none() {
+                // Removing a copied/filled cell must remove its OOXML node,
+                // not leave behind <c r="..." s="..."/>. This matters when
+                // Undo follows a successful Save on a macro-enabled workbook.
+                // Refuse to erase raw XML that wasn't represented in the model.
+                if old_cell.is_none() {
+                    return Err(IoError::Format(format!(
+                        "cannot safely remove an unmodeled Excel cell at {}!{}", sheet.name, a1
+                    )));
+                }
+                if attr_value(&text[start..start_tag_end], "t").as_deref() == Some("s") {
+                    sst.count_delta -= 1;
+                }
+                edits.push(Edit { start, end, replacement: String::new() });
+                continue;
+            }
 
             if let Some(style_index) = style_index
                 && old_formula == new_formula
@@ -1492,6 +1952,21 @@ pub fn patch_xlsx(original: &[u8], base: &Workbook, wb: &Workbook, dirty_cells: 
             text.replace_range(start..end, &replacement);
         }
 
+        let mut text = patch_row_metadata(&text, base_sheet, sheet)?;
+        // A newly created row may be empty after Undo. Keep original rows
+        // that have actual content or row properties, but remove synthetic
+        // wrappers that would otherwise expand Excel's used range.
+        for row in removed_rows {
+            if sheet.rows.contains_key(&row)
+                || sheet.cells.row(row, 0, gridcraft_core::MAX_COLS - 1).next().is_some()
+            {
+                continue;
+            }
+            let number = row + 1;
+            text = text.replace(&format!(r#"<row r="{number}"></row>"#), "");
+            text = text.replace(&format!(r#"<row r="{number}"/>"#), "");
+        }
+        let text = patch_merged_ranges(&text, &base_sheet.merges, &sheet.merges)?;
         replacements.insert(normalize(part), text.into_bytes());
     }
 
@@ -2780,5 +3255,369 @@ mod tests {
 
         assert_eq!(cell.formula.as_ref().unwrap().text, "A1+2");
         assert_eq!(cell.value, Value::Number(3.0));
+    }
+}
+
+
+#[cfg(test)]
+mod shared_formula_edit_tests {
+    use super::*;
+    use std::sync::Arc;
+    use gridcraft_model::{Cell, Formula, Sheet};
+
+    fn formula_at(sheet: &mut Sheet, address: &str, formula: &str, value: f64) {
+        let cell_ref = CellRef::parse(address).unwrap();
+        sheet.set_cell(cell_ref, Cell {
+            value: Value::Number(value),
+            formula: Some(Arc::new(Formula::new(formula))),
+            style: Default::default(),
+        });
+    }
+
+    #[test]
+    fn replacing_shared_formula_master_expands_children_without_losing_cache() {
+        let xml = r#"<worksheet><sheetData><row r="1"><c r="C1"><f t="shared" si="17" ref="C1:C2">A1*2</f><v>4</v></c></row><row r="2"><c r="C2"><f t="shared" si="17"/><v>6</v></c></row></sheetData></worksheet>"#;
+        let mut before = Sheet::new("Example");
+        formula_at(&mut before, "C1", "A1*2", 4.0);
+        formula_at(&mut before, "C2", "A2*2", 6.0);
+        let mut after = before.clone();
+        after.set_value(CellRef::parse("C1").unwrap(), Value::Number(19.0));
+        let dirty = BTreeSet::from([CellRef::parse("C1").unwrap()]);
+
+        let result = expand_edited_shared_formula_groups(xml, &before, &after, &dirty).unwrap();
+        assert!(!result.contains("t=\"shared\""));
+        assert!(result.contains(r#"<c r="C1"><f>A1*2</f><v>4</v></c>"#));
+        assert!(result.contains(r#"<c r="C2"><f>A2*2</f><v>6</v></c>"#));
+    }
+
+    #[test]
+    fn only_style_edit_does_not_rewrite_original_shared_formulas() {
+        let xml = r#"<worksheet><sheetData><row r="1"><c r="C1"><f t="shared" si="17">A1*2</f><v>4</v></c></row></sheetData></worksheet>"#;
+        let mut before = Sheet::new("Example");
+        formula_at(&mut before, "C1", "A1*2", 4.0);
+        let after = before.clone();
+        let dirty = BTreeSet::from([CellRef::parse("C1").unwrap()]);
+
+        assert_eq!(expand_edited_shared_formula_groups(xml, &before, &after, &dirty).unwrap(), xml);
+    }
+}
+
+
+#[cfg(test)]
+mod exact_xf_copy_tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn copy_preserves_source_xf_index_when_two_xfs_parse_to_same_style() {
+        // The source uses XF #2. XF #1 has the same modeled Style, so the
+        // normalized style lookup alone would incorrectly choose XF #1.
+        let styles = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font/><font><b/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border/></borders><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" applyFont="1"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" applyFont="1"/></cellXfs></styleSheet>"#;
+        let rels = r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>"#;
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1" s="2"><v>1</v></c><c r="B1"><v>2</v></c></row></sheetData>"#,
+            &[("xl/styles.xml", styles), ("xl/preserved.xml", "<preserved>keep</preserved>")],
+            rels,
+            "",
+        );
+
+        let (base, _) = crate::read_xlsx(&original).unwrap();
+        let mut edited = base.clone();
+        let a1 = CellRef::parse("A1").unwrap();
+        let b1 = CellRef::parse("B1").unwrap();
+        let source = base.sheet(0).unwrap().cell(a1).unwrap().clone();
+        edited.sheet_mut(0).unwrap().set_cell(b1, source);
+
+        let output = patch_xlsx_with_style_copies(&original, &base, &edited, &[(0, b1)], &[(0, a1, 0, b1)]).unwrap();
+        let mut zip = zip::ZipArchive::new(Cursor::new(&output)).unwrap();
+        let mut sheet_xml = String::new();
+        zip.by_name("xl/worksheets/sheet1.xml").unwrap().read_to_string(&mut sheet_xml).unwrap();
+        assert!(sheet_xml.contains(r#"<c r="B1" s="2"><v>1</v></c>"#), "{sheet_xml}");
+        let mut preserved = String::new();
+        zip.by_name("xl/preserved.xml").unwrap().read_to_string(&mut preserved).unwrap();
+        assert_eq!(preserved, "<preserved>keep</preserved>");
+    }
+
+    #[test]
+    fn no_style_copy_hint_keeps_normal_style_resolution() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#,
+            &[("xl/preserved.xml", "<preserved>keep</preserved>")],
+            "",
+            "",
+        );
+        let (base, _) = crate::read_xlsx(&original).unwrap();
+        let mut edited = base.clone();
+        let b1 = CellRef::parse("B1").unwrap();
+        edited.sheet_mut(0).unwrap().set_value(b1, Value::Number(5.0));
+        let baseline = patch_xlsx(&original, &base, &edited, &[(0, b1)]).unwrap();
+        let hinted = patch_xlsx_with_style_copies(&original, &base, &edited, &[(0, b1)], &[]).unwrap();
+        assert_eq!(baseline, hinted);
+    }
+}
+
+
+#[cfg(test)]
+mod merge_preservation_tests {
+    use super::*;
+    use std::io::Read;
+
+    fn read_part(bytes: &[u8], name: &str) -> String {
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut out = String::new();
+        zip.by_name(name).unwrap().read_to_string(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn merged_area_copy_updates_merge_cells_and_no_other_package_part() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>5</v></c></row></sheetData><mergeCells count="1"><mergeCell ref="A1:B1"/></mergeCells>"#,
+            &[("xl/preserved.xml", "<preserved>vba and other parts</preserved>")],
+            "",
+            "",
+        );
+        let (base, _) = crate::read_xlsx(&original).unwrap();
+        let mut edited = base.clone();
+        edited.sheet_mut(0).unwrap().merges.push(gridcraft_core::RangeRef::parse("C4:D4").unwrap());
+
+        let patched = patch_xlsx(&original, &base, &edited, &[]).unwrap();
+        let xml = read_part(&patched, "xl/worksheets/sheet1.xml");
+        assert!(xml.contains(r#"<mergeCells count="2">"#));
+        assert!(xml.contains(r#"<mergeCell ref="A1:B1"/>"#));
+        assert!(xml.contains(r#"<mergeCell ref="C4:D4"/>"#));
+        assert_eq!(
+            read_part(&patched, "xl/preserved.xml"),
+            read_part(&original, "xl/preserved.xml"),
+        );
+        let (roundtrip, _) = crate::read_xlsx(&patched).unwrap();
+        assert!(roundtrip.sheet(0).unwrap().merges.contains(&gridcraft_core::RangeRef::parse("C4:D4").unwrap()));
+    }
+
+    #[test]
+    fn first_merge_is_inserted_before_page_margins() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><pageMargins left="0.3" right="0.3" top="0.2" bottom="0.2" header="0" footer="0"/>"#,
+            &[],
+            "",
+            "",
+        );
+        let (base, _) = crate::read_xlsx(&original).unwrap();
+        let mut edited = base.clone();
+        edited.sheet_mut(0).unwrap().merges.push(gridcraft_core::RangeRef::parse("A1:B1").unwrap());
+        let patched = patch_xlsx(&original, &base, &edited, &[]).unwrap();
+        let xml = read_part(&patched, "xl/worksheets/sheet1.xml");
+        assert!(xml.find("<mergeCells").unwrap() < xml.find("<pageMargins").unwrap());
+        assert!(xml.contains(r#"<mergeCell ref="A1:B1"/>"#));
+    }
+
+    #[test]
+    fn overlapping_merges_are_rejected_instead_of_written() {
+        let original = crate::tests::minimal(r#"<sheetData/>"#, &[], "", "");
+        let (base, _) = crate::read_xlsx(&original).unwrap();
+        let mut edited = base.clone();
+        edited.sheet_mut(0).unwrap().merges.push(gridcraft_core::RangeRef::parse("A1:C1").unwrap());
+        edited.sheet_mut(0).unwrap().merges.push(gridcraft_core::RangeRef::parse("B1:D1").unwrap());
+        let err = patch_xlsx(&original, &base, &edited, &[]).unwrap_err().to_string();
+        assert!(err.contains("overlapping merged ranges"), "{err}");
+    }
+}
+
+
+#[cfg(test)]
+mod row_metadata_patch_tests {
+    use super::*;
+    use std::io::Read;
+
+    fn sheet_xml(package: &[u8]) -> String {
+        let mut archive = zip::ZipArchive::new(Cursor::new(package)).unwrap();
+        let mut s = String::new();
+        archive.by_name("xl/worksheets/sheet1.xml").unwrap().read_to_string(&mut s).unwrap();
+        s
+    }
+
+    #[test]
+    fn new_formatted_row_keeps_autofitted_height_after_save() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#,
+            &[("xl/opaque.xml", "<opaque>preserved</opaque>")],
+            "", "",
+        );
+        let (before, _) = crate::read_xlsx(&original).unwrap();
+        let mut after = before.clone();
+        after.sheet_mut(0).unwrap().rows.insert(
+            4,
+            gridcraft_model::LineInfo {
+                size: Some(45.5),
+                ..Default::default()
+            },
+        );
+        let patched = patch_xlsx(&original, &before, &after, &[]).unwrap();
+        let sheet = sheet_xml(&patched);
+        assert!(sheet.contains(r#"<row r="5" ht="45.5" customHeight="1"/>"#), "{sheet}");
+        let mut archive = zip::ZipArchive::new(Cursor::new(&patched)).unwrap();
+        let mut opaque = String::new();
+        archive.by_name("xl/opaque.xml").unwrap().read_to_string(&mut opaque).unwrap();
+        assert_eq!(opaque, "<opaque>preserved</opaque>");
+    }
+
+    #[test]
+    fn changing_existing_row_height_keeps_its_cell_contents() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1" ht="18" customHeight="1"><c r="A1"><v>7</v></c></row></sheetData>"#,
+            &[], "", "",
+        );
+        let (before, _) = crate::read_xlsx(&original).unwrap();
+        let mut after = before.clone();
+        after.sheet_mut(0).unwrap().rows.insert(
+            0,
+            gridcraft_model::LineInfo {size:Some(24.0), hidden:true, ..Default::default()}
+        );
+        let patched = patch_xlsx(&original, &before, &after, &[]).unwrap();
+        let sheet = sheet_xml(&patched);
+        assert!(sheet.contains(r#"ht="24""#), "{sheet}");
+        assert!(sheet.contains(r#"hidden="1""#), "{sheet}");
+        assert!(sheet.contains(r#"<c r="A1"><v>7</v></c>"#), "{sheet}");
+    }
+
+    #[test]
+    fn row_height_can_be_added_to_empty_sheetdata() {
+        let original = crate::tests::minimal(r#"<sheetData/>"#, &[], "", "");
+        let (before, _) = crate::read_xlsx(&original).unwrap();
+        let mut after = before.clone();
+        after.sheet_mut(0).unwrap().rows.insert(
+            2,
+            gridcraft_model::LineInfo {size:Some(30.0), ..Default::default()},
+        );
+        let patched = patch_xlsx(&original, &before, &after, &[]).unwrap();
+        let sheet = sheet_xml(&patched);
+        assert!(sheet.contains(r#"<sheetData><row r="3" ht="30" customHeight="1"/></sheetData>"#), "{sheet}");
+    }
+}
+
+
+#[cfg(test)]
+mod cell_removal_roundtrip_tests {
+    use super::*;
+    use std::io::Read;
+
+    fn worksheet(package: &[u8]) -> String {
+        let mut z = zip::ZipArchive::new(Cursor::new(package)).unwrap();
+        let mut xml = String::new();
+        z.by_name("xl/worksheets/sheet1.xml").unwrap().read_to_string(&mut xml).unwrap();
+        xml
+    }
+
+    #[test]
+    fn deleting_last_cell_removes_synthetic_row_instead_of_leaving_empty_style() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>7</v></c></row></sheetData>"#,
+            &[("xl/opaque.xml", "<opaque>preserve</opaque>")], "", "",
+        );
+        let (base, _) = crate::read_xlsx(&original).unwrap();
+        let mut after = base.clone();
+        after.sheet_mut(0).unwrap().remove_cell(CellRef::parse("A1").unwrap());
+        let patched = patch_xlsx(&original, &base, &after, &[(0, CellRef::parse("A1").unwrap())]).unwrap();
+        let xml = worksheet(&patched);
+        assert!(!xml.contains("A1"), "{xml}");
+        assert!(!xml.contains("<row r=\"1\""), "{xml}");
+        let (roundtrip, _) = crate::read_xlsx(&patched).unwrap();
+        assert!(roundtrip.sheet(0).unwrap().cell(CellRef::parse("A1").unwrap()).is_none());
+    }
+
+    #[test]
+    fn removing_one_of_two_cells_keeps_other_cell_and_row_intact() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>7</v></c><c r="B1"><v>8</v></c></row></sheetData>"#,
+            &[], "", "",
+        );
+        let (base, _) = crate::read_xlsx(&original).unwrap();
+        let mut after = base.clone();
+        after.sheet_mut(0).unwrap().remove_cell(CellRef::parse("A1").unwrap());
+        let patched = patch_xlsx(&original, &base, &after, &[(0, CellRef::parse("A1").unwrap())]).unwrap();
+        let xml = worksheet(&patched);
+        assert!(!xml.contains("<c r=\"A1\""), "{xml}");
+        assert!(xml.contains(r#"<c r="B1"><v>8</v></c>"#), "{xml}");
+        assert!(xml.contains(r#"<row r="1">"#), "{xml}");
+    }
+
+    #[test]
+    fn unmodeled_xml_cell_is_preserved_without_model_change() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>7</v></c></row></sheetData>"#,
+            &[], "", "",
+        );
+        let (mut base, _) = crate::read_xlsx(&original).unwrap();
+        base.sheet_mut(0).unwrap().remove_cell(CellRef::parse("A1").unwrap());
+        let after = base.clone();
+        // The imported model is missing this opaque XML cell, but the
+        // destination does not request its removal. Keep the original part.
+        let patched = patch_xlsx(&original, &base, &after, &[(0, CellRef::parse("A1").unwrap())]).unwrap();
+        assert_eq!(worksheet(&patched), worksheet(&original));
+    }
+}
+
+
+#[cfg(test)]
+mod formula_cache_preservation_tests {
+    use super::*;
+    use std::io::Read;
+
+    fn xml_sheet(package: &[u8]) -> String {
+        let mut archive = zip::ZipArchive::new(Cursor::new(package)).unwrap();
+        let mut result = String::new();
+        archive.by_name("xl/worksheets/sheet1.xml").unwrap().read_to_string(&mut result).unwrap();
+        result
+    }
+
+    #[test]
+    fn changed_dependent_formula_value_survives_excel_reopen() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>2</v></c><c r="B1"><f>A1*2</f><v>4</v></c></row></sheetData>"#,
+            &[("xl/opaque.xml", "<opaque>keep</opaque>")], "", "",
+        );
+        let (base, _) = crate::read_xlsx(&original).unwrap();
+        let mut updated = base.clone();
+        let b1 = CellRef::parse("B1").unwrap();
+        updated.sheet_mut(0).unwrap().cells.get_mut(b1).unwrap().value = Value::Number(10.0);
+        let patched = patch_xlsx(&original, &base, &updated, &[(0, b1)]).unwrap();
+        let sheet = xml_sheet(&patched);
+        assert!(sheet.contains("<f>A1*2</f><v>10</v>"), "{sheet}");
+        let (reopened, _) = crate::read_xlsx(&patched).unwrap();
+        assert_eq!(reopened.sheet(0).unwrap().value(b1), Value::Number(10.0));
+        assert_eq!(reopened.sheet(0).unwrap().cell(b1).unwrap().formula.as_ref().unwrap().text, "A1*2");
+    }
+
+    #[test]
+    fn updated_shared_formula_cache_keeps_original_master_and_child_markup() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>2</v></c><c r="C1"><f t="shared" si="7" ref="C1:C2">A1*2</f><v>4</v></c></row><row r="2"><c r="A2"><v>3</v></c><c r="C2"><f t="shared" si="7"/><v>6</v></c></row></sheetData>"#,
+            &[("xl/opaque.xml", "<opaque>keep</opaque>")], "", "",
+        );
+        let (base, _) = crate::read_xlsx(&original).unwrap();
+        let mut updated = base.clone();
+        let c2 = CellRef::parse("C2").unwrap();
+        updated.sheet_mut(0).unwrap().cells.get_mut(c2).unwrap().value = Value::Number(9.0);
+        let patched = patch_xlsx(&original, &base, &updated, &[(0, c2)]).unwrap();
+        let sheet = xml_sheet(&patched);
+        assert!(sheet.contains(r#"<f t="shared" si="7" ref="C1:C2">A1*2</f><v>4</v>"#), "{sheet}");
+        assert!(sheet.contains(r#"<f t="shared" si="7"/><v>9</v>"#), "{sheet}");
+        let (reopened, _) = crate::read_xlsx(&patched).unwrap();
+        assert_eq!(reopened.sheet(0).unwrap().value(c2), Value::Number(9.0));
+    }
+
+    #[test]
+    fn unsupported_recalculation_error_never_replaces_excel_cached_number() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>2</v></c><c r="B1"><f>A1*2</f><v>4</v></c></row></sheetData>"#,
+            &[], "", "",
+        );
+        let (base, _) = crate::read_xlsx(&original).unwrap();
+        let mut updated = base.clone();
+        let b1 = CellRef::parse("B1").unwrap();
+        updated.sheet_mut(0).unwrap().cells.get_mut(b1).unwrap().value =
+            Value::Error(gridcraft_core::CellError::Name);
+        let patched = patch_xlsx(&original, &base, &updated, &[(0, b1)]).unwrap();
+        assert_eq!(xml_sheet(&patched), xml_sheet(&original));
     }
 }

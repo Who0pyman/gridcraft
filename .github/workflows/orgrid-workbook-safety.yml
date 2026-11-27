@@ -1,0 +1,75 @@
+name: ORGrid workbook preservation
+
+# Run this QA workflow only when explicitly dispatched. Frequent PR commits were
+# generating redundant GitHub Actions failures and email notifications.
+on:
+  workflow_dispatch:
+
+jobs:
+  excel-preservation:
+    # Pin glibc for a QA executable runnable outside hosted Actions.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Engine workbook protection regression
+        run: cargo test -p gridcraft-engine macro_enabled_workbook -- --nocapture
+      - name: Preserve imported XLSX templates
+        run: cargo test -p gridcraft-engine imported_xlsx -- --nocapture
+      - name: Shared-formula normalization regressions
+        run: cargo test -p gridcraft-xlsx shared_formula_edit_tests -- --nocapture
+      - name: Exact source cell formatting regressions
+        run: cargo test -p gridcraft-xlsx exact_xf_copy_tests -- --nocapture
+      - name: Merge preservation regressions
+        run: cargo test -p gridcraft-xlsx merge_preservation_tests -- --nocapture
+      - name: Row-height and metadata regressions
+        run: cargo test -p gridcraft-xlsx row_metadata_patch_tests -- --nocapture
+      - name: Imported Excel calculation caches
+        run: cargo test -p gridcraft-engine excel_open_preserves_cached_formula_results_and_rebuilds_dependencies -- --nocapture
+      - name: Non-cell metadata preservation
+        run: cargo test -p gridcraft-engine imported_title_workbook_rejects_unpatchable_noncell_changes -- --nocapture
+      - name: Byte export of macro-enabled packages
+        run: cargo test -p gridcraft-engine macro_workbook_byte_export_keeps_original_package_for_noop -- --nocapture
+      - name: Undo and redo preserve Excel save tracking
+        run: cargo test -p gridcraft-engine undo_and_redo_restore -- --nocapture
+      - name: Undo after save round-trip
+        run: cargo test -p gridcraft-engine undo_after_save_rebases_xlsm_cell_edit_against_new_package -- --nocapture
+      - name: Unsafe structural undo after save is blocked
+        run: cargo test -p gridcraft-engine undoing_structural_edit_after_save_refuses_unverified_package_rewrite -- --nocapture
+      - name: CLI workbook regression
+        run: cargo test -p gridcraft-cli --test cli -- --nocapture
+      - name: Build GridCraft CLI for package preservation QA
+        run: cargo build -p gridcraft-cli
+      - name: Synthetic macro-enabled Excel end-to-end smoke test
+        run: python3 tools/orgrid_xlsm_smoke.py target/debug/gridcraft-cli
+      - name: Export compiled QA CLI for local confidential workbook verification
+        uses: actions/upload-artifact@v4
+        with:
+          name: orgrid-linux-qa-cli
+          path: target/debug/gridcraft-cli
+          if-no-files-found: error
+          retention-days: 2
+
+  macos-preview:
+    needs: excel-preservation
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.100.0
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build ad-hoc signed Apple Silicon test installer
+        run: bash packaging/macos/package.sh --arch aarch64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orgrid-macos-aarch64-preview
+          path: dist/release/gridcraft-0.4.0-macos-aarch64.dmg
+          if-no-files-found: error
+          retention-days: 14

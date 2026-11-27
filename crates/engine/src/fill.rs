@@ -77,6 +77,9 @@ pub fn fill(cx: &mut Ctx, sheet: usize, src: RangeRef, target: RangeRef, mode: F
             let idx = k % src_cells.len().max(1);
             let (sc, scell) = src_cells.get(if forward { idx } else { src_cells.len() - 1 - idx }).cloned().unwrap_or((src.start, None));
             let mut cell = scell.clone().unwrap_or_default();
+            if scell.is_some() && mode != FillMode::ValuesOnly {
+                cx.xlsx_style_copies.push((sheet, sc, sheet, *t));
+            }
             match mode {
                 FillMode::Formats => {
                     let mut existing = sh.cell(*t).cloned().unwrap_or_default();
