@@ -365,11 +365,15 @@ pub struct Calc {
     /// Cells whose formulas have errors from cycles.
     pub circular: Vec<Key>,
     pub last_recalc_cells: usize,
+    /// Formula cells whose cached calculation results changed in the most
+    /// recent calculation pass. Excel package saves can persist these caches
+    /// without reconstructing unsupported workbook components.
+    pub last_recalc_changed: Vec<Key>,
 }
 
 impl Default for Calc {
     fn default() -> Self {
-        Calc { graph: Graph::default(), rng: 0x9E37_79B9_7F4A_7C15, fixed_now: None, circular: vec![], last_recalc_cells: 0 }
+        Calc { graph: Graph::default(), rng: 0x9E37_79B9_7F4A_7C15, fixed_now: None, circular: vec![], last_recalc_cells: 0, last_recalc_changed: vec![] }
     }
 }
 
@@ -784,6 +788,7 @@ impl Calc {
 
     /// Evaluates the dirty set and writes results (and spills) back.
     fn run(&mut self, wb: &mut Workbook, mut dirty: Vec<Key>, full: bool) {
+        self.last_recalc_changed.clear();
         let mut dynamic_again = !self.graph.dynamic.is_empty();
         for _round in 0..8 {
             if dirty.is_empty() {
@@ -836,6 +841,9 @@ impl Calc {
                     && cell.value != v
                 {
                     cell.value = v;
+                    if cell.formula.is_some() {
+                        self.last_recalc_changed.push(k);
+                    }
                 }
             }
             for k in &dirty {
@@ -916,6 +924,8 @@ impl Calc {
             }
             dirty = self.dirty_closure(wb, &spill_changes);
         }
+        self.last_recalc_changed.sort_unstable();
+        self.last_recalc_changed.dedup();
     }
 }
 
