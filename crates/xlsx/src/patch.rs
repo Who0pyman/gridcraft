@@ -3483,7 +3483,7 @@ mod cell_removal_roundtrip_tests {
     }
 
     #[test]
-    fn deletion_of_unmodeled_xml_cell_does_not_silently_destroy_it() {
+    fn unmodeled_xml_cell_is_preserved_without_model_change() {
         let original = crate::tests::minimal(
             r#"<sheetData><row r="1"><c r="A1"><v>7</v></c></row></sheetData>"#,
             &[], "", "",
@@ -3491,8 +3491,9 @@ mod cell_removal_roundtrip_tests {
         let (mut base, _) = crate::read_xlsx(&original).unwrap();
         base.sheet_mut(0).unwrap().remove_cell(CellRef::parse("A1").unwrap());
         let after = base.clone();
-        // Imported model was missing the XML cell. The patch must fail closed.
-        let err = patch_xlsx(&original, &base, &after, &[(0, CellRef::parse("A1").unwrap())]).unwrap_err().to_string();
-        assert!(err.contains("cannot safely remove") || err.contains("unmodeled"), "{err}");
+        // The imported model is missing this opaque XML cell, but the
+        // destination does not request its removal. Keep the original part.
+        let patched = patch_xlsx(&original, &base, &after, &[(0, CellRef::parse("A1").unwrap())]).unwrap();
+        assert_eq!(worksheet(&patched), worksheet(&original));
     }
 }
