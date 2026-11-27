@@ -223,6 +223,34 @@ def main():
         assert undone.keys() == original.keys(), "Undo after save lost workbook components"
         print("PASS save/undo/save: undone cell absent and all package parts retained")
 
+        # A title calculation edit must persist dependent Excel cache values.
+        # Without this check an XLSM looks right on screen, but reopens with
+        # stale ownership calculations. No original template formulas change.
+        recalc_file = work / "dependent-caches.xlsm"
+        run(cli, workbook, recalc_file, [
+            ("sheet.activate", {"sheet": args.copy_sheet}),
+            ("cell.set", {"cell": "M18", "input": "0.3"}),
+        ])
+        recalc = package(recalc_file)
+        allowed_calculation_parts = {part for part in original if part.startswith("xl/worksheets/")}
+        allowed_calculation_parts.update({"xl/styles.xml", "xl/sharedStrings.xml"})
+        compare_components(original, recalc, allowed_calculation_parts)
+        def numeric(parts, address):
+            item = cell(parts, args.copy_sheet, address)
+            value = item.find(S + "v") if item is not None else None
+            assert value is not None and value.text is not None, f"No cached value for {address}"
+            return float(value.text)
+        assert abs(numeric(recalc, "AM18") - 0.3) < 1e-12, "AM18 cached WI formula is stale"
+        assert abs(numeric(recalc, "AP18") - 0.313125) < 1e-12, "AP18 cached royalty formula is stale"
+        assert abs(numeric(recalc, "AL18") - numeric(recalc, "AJ18") * 0.7) < 1e-10, "AL18 cached NRI formula is stale"
+        for address in ("AM18", "AL18", "AP18"):
+            old_f = cell(original, args.copy_sheet, address).find(S + "f")
+            new_f = cell(recalc, args.copy_sheet, address).find(S + "f")
+            assert old_f is not None and new_f is not None
+            assert ET.tostring(old_f) == ET.tostring(new_f), f"Formula XML was altered at {address}"
+        print("PASS updated WI/NRI caches: Excel formulas preserved, reopened numeric results current")
+
+
     print("PASS actual-workbook QA checks. This does not certify VBA execution or full Excel feature parity.")
 
 
