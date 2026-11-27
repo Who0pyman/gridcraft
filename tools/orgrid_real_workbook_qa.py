@@ -156,6 +156,26 @@ def main():
         assert "AJ900:AK900" in merge_refs, "Copied Excel merged cells were not saved"
         print("PASS merged-range copy: new merge persisted, opaque package intact")
 
+        # A saved merged copy must undo cleanly: no styled blank cells and
+        # no synthetic row left behind in the original worksheet.
+        merge_saved = work / "merge-saved.xlsm"
+        merge_undone = work / "merge-undone.xlsm"
+        run(cli, workbook, merge_undone, [
+            ("sheet.activate", {"sheet": args.copy_sheet}),
+            ("edit.copy", {"range": "AJ18:AK18"}),
+            ("edit.paste", {"at": "AJ900"}),
+            ("file.save", {"path": str(merge_saved)}),
+            ("edit.undo", {}),
+            ("file.save", {"path": str(merge_undone)}),
+        ])
+        restored = package(merge_undone)
+        assert restored.keys() == original.keys(), "Undo lost an XLSM component"
+        assert restored[copy_part] == original[copy_part], (
+            "Undo left behind copied cell formatting, row records, or merge XML"
+        )
+        print("PASS saved merged-range undo: original worksheet restored exactly")
+
+
         # Copy the actual leasehold row. Check exact Excel style indices, not just
         # normalized style equivalence, for every copied populated source cell.
         row_file = work / "row-copy.xlsm"
