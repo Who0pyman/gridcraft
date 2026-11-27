@@ -6,12 +6,13 @@ Never modifies the source file or uploads it to a network service.
 Usage:
   python3 tools/orgrid_real_workbook_qa.py /path/to/gridcraft-cli "/path/to/workbook.xlsm"
 
-This audit checks ordinary edit, exact-style copy, and undo-after-save.
+This audit checks ordinary edit, exact-style copy, merged areas, whole-row copy, and undo-after-save.
 It compares every decompressed OOXML component, including opaque VBA parts.
 """
 import argparse
 import json
 import posixpath
+import re
 import subprocess
 import sys
 import tempfile
@@ -141,6 +142,72 @@ def main():
         assert source_formula is not None and dest_formula is not None, "Copied formula missing"
         print("PASS copy: same exact XF style, formula copied, package intact", sorted(changes))
 
+        # Validate copied merges, including the original opaque workbook parts.
+        merged_file = work / "merged-copy.xlsm"
+        run(cli, workbook, merged_file, [
+            ("sheet.activate", {"sheet": args.copy_sheet}),
+            ("edit.copy", {"range": "AJ18:AK18"}),
+            ("edit.paste", {"at": "AJ900"}),
+        ])
+        merged = package(merged_file)
+        compare_components(original, merged, {copy_part, "xl/styles.xml"})
+        merged_sheet = ET.fromstring(merged[copy_part])
+        merge_refs = {node.get("ref") for node in merged_sheet.iter(S + "mergeCell")}
+        assert "AJ900:AK900" in merge_refs, "Copied Excel merged cells were not saved"
+        print("PASS merged-range copy: new merge persisted, opaque package intact")
+
+        # A saved merged copy must undo cleanly: no styled blank cells and
+        # no synthetic row left behind in the original worksheet.
+        merge_saved = work / "merge-saved.xlsm"
+        merge_undone = work / "merge-undone.xlsm"
+        run(cli, workbook, merge_undone, [
+            ("sheet.activate", {"sheet": args.copy_sheet}),
+            ("edit.copy", {"range": "AJ18:AK18"}),
+            ("edit.paste", {"at": "AJ900"}),
+            ("file.save", {"path": str(merge_saved)}),
+            ("edit.undo", {}),
+            ("file.save", {"path": str(merge_undone)}),
+        ])
+        restored = package(merge_undone)
+        assert restored.keys() == original.keys(), "Undo lost an XLSM component"
+        assert restored[copy_part] == original[copy_part], (
+            "Undo left behind copied cell formatting, row records, or merge XML"
+        )
+        print("PASS saved merged-range undo: original worksheet restored exactly")
+
+
+        # Copy the actual leasehold row. Check exact Excel style indices, not just
+        # normalized style equivalence, for every copied populated source cell.
+        row_file = work / "row-copy.xlsm"
+        run(cli, workbook, row_file, [
+            ("sheet.activate", {"sheet": args.copy_sheet}),
+            ("edit.copy", {"range": "A18:KQ18"}),
+            ("edit.paste", {"at": "A900"}),
+        ])
+        row = package(row_file)
+        compare_components(original, row, {copy_part, "xl/styles.xml", "xl/sharedStrings.xml"})
+        original_row = ET.fromstring(original[copy_part])
+        copied_row = ET.fromstring(row[copy_part])
+        dest_by_ref = {c.get("r"): c for c in copied_row.iter(S + "c")}
+        cells_checked = formulas_checked = 0
+        for src_cell in original_row.iter(S + "c"):
+            address = src_cell.get("r", "")
+            if not re.fullmatch(r"[A-Z]+18", address):
+                continue
+            target = re.match(r"[A-Z]+", address).group() + "900"
+            copy_cell = dest_by_ref.get(target)
+            assert copy_cell is not None, f"Row copy lost {address}"
+            assert src_cell.get("s", "0") == copy_cell.get("s", "0"), (
+                f"Exact Excel style mismatch for {address} -> {target}"
+            )
+            cells_checked += 1
+            if src_cell.find(S + "f") is not None:
+                assert copy_cell.find(S + "f") is not None, f"Copied formula missing at {target}"
+                formulas_checked += 1
+        assert cells_checked > 0 and formulas_checked > 0
+        assert "AJ900:AK900" in {node.get("ref") for node in copied_row.iter(S + "mergeCell")}
+        print(f"PASS row copy: {cells_checked} cell styles, {formulas_checked} formulas, merges, and package intact")
+
         first = work / "undo-first.xlsm"
         final = work / "undo-final.xlsm"
         run(cli, workbook, final, [
@@ -155,6 +222,34 @@ def main():
             raise AssertionError("CRITICAL: Undo after save did not remove the edit")
         assert undone.keys() == original.keys(), "Undo after save lost workbook components"
         print("PASS save/undo/save: undone cell absent and all package parts retained")
+
+        # A title calculation edit must persist dependent Excel cache values.
+        # Without this check an XLSM looks right on screen, but reopens with
+        # stale ownership calculations. No original template formulas change.
+        recalc_file = work / "dependent-caches.xlsm"
+        run(cli, workbook, recalc_file, [
+            ("sheet.activate", {"sheet": args.copy_sheet}),
+            ("cell.set", {"cell": "M18", "input": "0.3"}),
+        ])
+        recalc = package(recalc_file)
+        allowed_calculation_parts = {part for part in original if part.startswith("xl/worksheets/")}
+        allowed_calculation_parts.update({"xl/styles.xml", "xl/sharedStrings.xml"})
+        compare_components(original, recalc, allowed_calculation_parts)
+        def numeric(parts, address):
+            item = cell(parts, args.copy_sheet, address)
+            value = item.find(S + "v") if item is not None else None
+            assert value is not None and value.text is not None, f"No cached value for {address}"
+            return float(value.text)
+        assert abs(numeric(recalc, "AM18") - 0.3) < 1e-12, "AM18 cached WI formula is stale"
+        assert abs(numeric(recalc, "AP18") - 0.313125) < 1e-12, "AP18 cached royalty formula is stale"
+        assert abs(numeric(recalc, "AL18") - numeric(recalc, "AJ18") * 0.7) < 1e-10, "AL18 cached NRI formula is stale"
+        for address in ("AM18", "AL18", "AP18"):
+            old_f = cell(original, args.copy_sheet, address).find(S + "f")
+            new_f = cell(recalc, args.copy_sheet, address).find(S + "f")
+            assert old_f is not None and new_f is not None
+            assert ET.tostring(old_f) == ET.tostring(new_f), f"Formula XML was altered at {address}"
+        print("PASS updated WI/NRI caches: Excel formulas preserved, reopened numeric results current")
+
 
     print("PASS actual-workbook QA checks. This does not certify VBA execution or full Excel feature parity.")
 
