@@ -1,0 +1,48 @@
+name: Silent ORGrid compiler audit
+
+on:
+  push:
+    branches: [chatgpt/orgrid-silent-ci-20261126]
+
+permissions:
+  contents: read
+
+jobs:
+  rust-compatibility:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Collect compiler and regression results without failing the workflow
+        shell: bash
+        run: |
+          mkdir -p qa-results
+          set +e
+          cargo check -p gridcraft-engine -p gridcraft-xlsx -p gridcraft-cli >qa-results/check.log 2>&1
+          echo "$?" >qa-results/check.exit
+          cargo test -p gridcraft-xlsx exact_xf_copy_tests -- --nocapture >qa-results/xfs.log 2>&1
+          echo "$?" >qa-results/xfs.exit
+          cargo test -p gridcraft-xlsx merge_preservation_tests -- --nocapture >qa-results/merges.log 2>&1
+          echo "$?" >qa-results/merges.exit
+          cargo test -p gridcraft-xlsx row_metadata_patch_tests -- --nocapture >qa-results/rows.log 2>&1
+          echo "$?" >qa-results/rows.exit
+          cargo test -p gridcraft-engine undo_after_save -- --nocapture >qa-results/undo.log 2>&1
+          echo "$?" >qa-results/undo.exit
+          cargo test -p gridcraft-engine undo_and_redo -- --nocapture >qa-results/undo_redo.log 2>&1
+          echo "$?" >qa-results/undo_redo.exit
+          for name in check xfs merges rows undo undo_redo; do
+            echo "$name exit=$(cat qa-results/$name.exit)"
+            tail -n 15 "qa-results/$name.log"
+          done
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true
+        with:
+          name: orgrid-silent-audit-results
+          path: qa-results/
+          retention-days: 2
