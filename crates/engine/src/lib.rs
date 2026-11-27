@@ -117,6 +117,9 @@ pub struct DocState {
     pub xlsx_structural_dirty: bool,
     /// Changes when the original Excel package baseline is successfully saved.
     pub xlsx_epoch: u64,
+    /// True only for byte-identical workbooks exported by this session's
+    /// GridCraft native writer; these can safely use that writer again.
+    pub native_xlsx: bool,
     /// Per-sheet selection memory.
     pub sheet_selections: Vec<Selection>,
 }
@@ -163,6 +166,7 @@ impl DocState {
             xlsx_structural_edits: vec![],
             xlsx_structural_dirty: false,
             xlsx_epoch: 0,
+            native_xlsx: false,
             sheet_selections: vec![],
         }
     }
@@ -245,6 +249,10 @@ pub struct Session {
     pub draw_tool: String,
     pub draw_color: String,
     pub draw_width: f32,
+    /// A bounded set of exact XLSX byte packages created by the native writer
+    /// during this session. Other imported workbooks must never use the full
+    /// writer, because it can lose VBA, external links and drawing metadata.
+    pub recent_native_xlsx_exports: Vec<Vec<u8>>,
 }
 
 impl Session {
