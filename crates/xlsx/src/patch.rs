@@ -3435,3 +3435,64 @@ mod row_metadata_patch_tests {
         assert!(sheet.contains(r#"<sheetData><row r="3" ht="30" customHeight="1"/></sheetData>"#), "{sheet}");
     }
 }
+
+
+#[cfg(test)]
+mod cell_removal_roundtrip_tests {
+    use super::*;
+    use std::io::Read;
+
+    fn worksheet(package: &[u8]) -> String {
+        let mut z = zip::ZipArchive::new(Cursor::new(package)).unwrap();
+        let mut xml = String::new();
+        z.by_name("xl/worksheets/sheet1.xml").unwrap().read_to_string(&mut xml).unwrap();
+        xml
+    }
+
+    #[test]
+    fn deleting_last_cell_removes_synthetic_row_instead_of_leaving_empty_style() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>7</v></c></row></sheetData>"#,
+            &[("xl/opaque.xml", "<opaque>preserve</opaque>")], "", "",
+        );
+        let (base, _) = crate::read_xlsx(&original).unwrap();
+        let mut after = base.clone();
+        after.sheet_mut(0).unwrap().remove_cell(CellRef::parse("A1").unwrap());
+        let patched = patch_xlsx(&original, &base, &after, &[(0, CellRef::parse("A1").unwrap())]).unwrap();
+        let xml = worksheet(&patched);
+        assert!(!xml.contains("A1"), "{xml}");
+        assert!(!xml.contains("<row r=\"1\""), "{xml}");
+        let (roundtrip, _) = crate::read_xlsx(&patched).unwrap();
+        assert!(roundtrip.sheet(0).unwrap().cell(CellRef::parse("A1").unwrap()).is_none());
+    }
+
+    #[test]
+    fn removing_one_of_two_cells_keeps_other_cell_and_row_intact() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>7</v></c><c r="B1"><v>8</v></c></row></sheetData>"#,
+            &[], "", "",
+        );
+        let (base, _) = crate::read_xlsx(&original).unwrap();
+        let mut after = base.clone();
+        after.sheet_mut(0).unwrap().remove_cell(CellRef::parse("A1").unwrap());
+        let patched = patch_xlsx(&original, &base, &after, &[(0, CellRef::parse("A1").unwrap())]).unwrap();
+        let xml = worksheet(&patched);
+        assert!(!xml.contains("<c r=\"A1\""), "{xml}");
+        assert!(xml.contains(r#"<c r="B1"><v>8</v></c>"#), "{xml}");
+        assert!(xml.contains(r#"<row r="1">"#), "{xml}");
+    }
+
+    #[test]
+    fn deletion_of_unmodeled_xml_cell_does_not_silently_destroy_it() {
+        let original = crate::tests::minimal(
+            r#"<sheetData><row r="1"><c r="A1"><v>7</v></c></row></sheetData>"#,
+            &[], "", "",
+        );
+        let (mut base, _) = crate::read_xlsx(&original).unwrap();
+        base.sheet_mut(0).unwrap().remove_cell(CellRef::parse("A1").unwrap());
+        let after = base.clone();
+        // Imported model was missing the XML cell. The patch must fail closed.
+        let err = patch_xlsx(&original, &base, &after, &[(0, CellRef::parse("A1").unwrap())]).unwrap_err().to_string();
+        assert!(err.contains("cannot safely remove") || err.contains("unmodeled"), "{err}");
+    }
+}
